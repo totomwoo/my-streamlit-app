@@ -1,32 +1,35 @@
 
 import os
+import base64
 import streamlit as st
 from openai import OpenAI
 
 # OpenAI 클라이언트 생성
-client = OpenAI()
+client =
 
 # 페이지 설정
-st.set_page_config(page_title="간단한 챗봇", page_icon="🤖")
-st.title("🤖 단순 챗봇")
-st.write("대화를 기억하지 않는 단순 챗봇입니다.")
+st.set_page_config(     )
+st.title(     )
 
-# 사용자 질문
-prompt = st.text_input("질문을 입력하세요")
+# 텍스트 입력
+text = st.text_area(
+    "읽을 텍스트를 입력하세요",
+    "안녕하세요. OpenAI 텍스트 음성 변환 실습입니다."
+)
 
-# 질문 버튼
-if st.button("질문하기"):
-    if prompt.strip() == "":
-        st.warning("질문을 입력하세요")
+# 버튼
+if st.button(      ):
+    if text.strip() == "":
+        st.warning(      )
     else:
-         with st.spinner("답변 생성 중입니다..."):
-            # LLM 호출
-            response = client.responses.create(
-                model="gpt-4o-mini",
-                input=[{"role": "user", "content": prompt}]
-            )
-            answer = response.output_text
+        # TTS 생성
+        speech = client.audio.speech.create(
+            model=     ,
+            voice=     ,
+            input=
+        )
+        audio_bytes =
 
-            # 결과 출력
-            st.subheader("AI 답변")
-            st.write(answer)
+        # 음성 출력
+        st.markdown("### 🔊 음성 재생")
+        st.audio(speech.content, format="audio/mp3")
