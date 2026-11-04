@@ -13,10 +13,10 @@
 #
 # 데모 전제
 #   - 캘린더는 앱 안 저장소만 사용 (구글 캘린더 연동 없음). 앱이 재시작/재배포되면 초기화됩니다.
-#   - 모든 메일은 실제로는 MY_EMAIL(김 대리 본인) 한 곳으로만 발송되고, 제목/본문에 원래 받는 사람을 표시합니다.
+#   - '메일 보내기' 확인 창에서 입력한 주소로 실제 발송합니다. 협업·미팅 요청 알림은 팀원 주소가 가상이라 MY_EMAIL 로 보냅니다.
 # =========================================================
 
-import os, json, html, hashlib, uuid, smtplib, threading, base64
+import os, re, json, html, hashlib, uuid, smtplib, threading, base64
 import calendar as cal_lib
 from datetime import date, datetime, time, timedelta, timezone
 from email.mime.text import MIMEText
@@ -49,7 +49,7 @@ DEFAULT_MY_EMAIL = "totomwoo@gmail.com"     # MY_EMAIL Secrets 가 없을 때 �
 REQUEST_TYPES = ["미팅 요청", "협업 요청"]
 DURATIONS = [30, 60, 90]
 
-# 팀 주소록 (데모용 가짜 주소). 김 대리는 MY_EMAIL. 실제 발송은 모두 MY_EMAIL 로만 간다.
+# 팀 주소록 (가상 주소). 김 대리는 MY_EMAIL. 메일 확인 창에서는 가상 주소를 비워 두고 실제 주소를 입력받는다.
 DEMO_CONTACTS = [
     ("팀장", "teamlead@aivle-demo.kr"),
     ("박과장", "park@aivle-demo.kr"),
@@ -773,6 +773,11 @@ def send_email(to, subject, body):
         return {"status": "failed", "error": str(e)}
 
 
+def is_email(addr):
+    """간단한 이메일 형식 검사"""
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", (addr or "").strip()))
+
+
 def send_demo_email(to_label, to_email, subject, body):
     """모든 메일을 MY_EMAIL 로 보내되 원래 받는 사람을 표시"""
     actual_to, subject2, body2 = demo_envelope(to_label, to_email, subject, body, MY_EMAIL)
@@ -1485,22 +1490,22 @@ def execute_calendar_all():
 
 
 def execute_email(action, to_label, to_email, subject, body):
-    """확인된 메일 발송 (데모: 실제 수신은 MY_EMAIL)"""
-    if "@" not in (to_email or ""):
+    """확인된 메일 발송: 확인 창에 입력한 주소로 보낸다"""
+    if not is_email(to_email):
         set_notice("error", "받는 사람 이메일 주소를 확인해 주세요. (예: name@gmail.com)")
         return
     if not GMAIL_OK:
         set_notice("note", "Gmail 이 설정되지 않아 메일을 보낼 수 없어요. 사이드바 '설정 안내'를 열어 GMAIL_ADDRESS, GMAIL_APP_PASSWORD 를 추가한 뒤 다시 '보내기'를 눌러 주세요.")
         return
     with st.spinner("메일을 보내는 중…"):
-        result = send_demo_email(to_label, to_email, subject.strip(), body)
+        result = send_email(to_email.strip(), subject.strip(), body)       # 입력한 주소로 실제 발송
     if result.get("status") == "success":
         remove_pending(action["id"])
         update_tool_status(action, "done")
         st.session_state.emails_sent += 1
         append_assistant(f"{to_label}에게 메일을 보냈어요. 제목은 '{subject.strip()}' 입니다.",
                          tools=[["send_email", "done"]])
-        st.toast(f"메일을 보냈어요 → {MY_EMAIL}")
+        st.toast(f"메일을 보냈어요 → {to_email.strip()}")
     else:
         set_notice("error", f"메일 발송에 실패했어요: {result.get('error')} — Secrets 의 GMAIL_ADDRESS / GMAIL_APP_PASSWORD(앱 비밀번호 16자리)를 확인하고 다시 '보내기'를 눌러 주세요.")
 
@@ -1671,13 +1676,21 @@ def email_dialog():
     total, _ = dlg_prepare(action)
     skip_label = "건너뛰기" if total > 1 else "취소"
 
+    # 받는 사람 이름 · 메일 주소 (위아래 입력칸). 주소록의 가상 주소는 비워 두고 직접 입력받는다
+    if f"dlg_ename_{aid}" not in st.session_state:
+        addr = args.get("to_email") or ""
+        st.session_state[f"dlg_ename_{aid}"] = args.get("to_label") or ""
+        st.session_state[f"dlg_eaddr_{aid}"] = "" if addr.endswith("@aivle-demo.kr") else addr
+    to_label = st.text_input("받는 사람", key=f"dlg_ename_{aid}", placeholder="예: 팀장님")
+    to_email = st.text_input("메일 주소", key=f"dlg_eaddr_{aid}", placeholder="예: name@gmail.com")
+    args["to_label"], args["to_email"] = to_label, to_email
+
     if st.session_state.dlg_mode == "summary":
-        dlg_row("받는 사람", f"{args.get('to_label')} <{args.get('to_email')}>")
         dlg_row("제목", args.get("subject", ""))
         dlg_row("본문", args.get("body", ""))
         b1, b2, b3 = right_row(3)
         if b1.button("보내기", key=f"dlg_send_{aid}", type="primary"):
-            execute_email(action, args.get("to_label"), args.get("to_email"), args.get("subject", ""), args.get("body", ""))
+            execute_email(action, to_label or to_email, to_email, args.get("subject", ""), args.get("body", ""))
             st.rerun()
         if b2.button("수정하기", key=f"dlg_edit_{aid}"):
             st.session_state.dlg_mode = "edit"
@@ -1686,23 +1699,16 @@ def email_dialog():
             cancel_action(action)
             st.rerun()
     else:
-        names = [name for name, _ in CONTACTS] + ["직접 입력"]
-        default = args.get("to_label") if args.get("to_label") in names else "직접 입력"
-        pick = st.selectbox("받는 사람", names, index=names.index(default), key=f"dlg_eto_{aid}")
-        if pick == "직접 입력":
-            to_email = st.text_input("이메일 주소", value=args.get("to_email") if args.get("to_label") not in CONTACT_EMAIL else "", key=f"dlg_eto_free_{aid}")
-            to_label = to_email
-        else:
-            to_label, to_email = pick, CONTACT_EMAIL[pick]
         subject = st.text_input("제목", value=args.get("subject", ""), key=f"dlg_esubject_{aid}")
         body = st.text_area("본문", value=args.get("body", ""), height=220, key=f"dlg_ebody_{aid}")
         b1, b2 = right_row(2)
         if b1.button("저장하고 보내기", key=f"dlg_save_{aid}", type="primary"):
             st.session_state.dlg_mode = "summary"
-            args.update(to_label=to_label, to_email=to_email, subject=subject, body=body)
-            execute_email(action, to_label, to_email, subject, body)
+            args.update(subject=subject, body=body)
+            execute_email(action, to_label or to_email, to_email, subject, body)
             st.rerun()
         if b2.button("돌아가기", key=f"dlg_back_{aid}"):
+            args.update(subject=subject, body=body)
             st.session_state.dlg_mode = "summary"
             st.rerun()
 
