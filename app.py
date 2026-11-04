@@ -43,7 +43,7 @@ MAX_TURNS = 10                              # 대화 기록 유지 턴 수
 WEEKDAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
 WEEKDAY_EN = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 STEP_LABELS = ["회의록 올리기", "업무 확인 · 일정 등록", f"{APP_NAME}에게 부탁하기"]
-PAGES = {"assistant": f"{APP_NAME}에게 부탁하기", "tasks": "내 업무", "calendar": "캘린더", "requests": "받은 요청"}
+PAGES = {"assistant": f"{APP_NAME}에게 부탁하기", "summary": "회의록 요약", "tasks": "내 업무", "calendar": "캘린더", "requests": "받은 요청"}
 DEFAULT_MY_EMAIL = "totomwoo@gmail.com"     # MY_EMAIL Secrets 가 없을 때 쓰는 기본 수신자 (사용자 승인)
 REQUEST_TYPES = ["미팅 요청", "협업 요청"]
 DURATIONS = [30, 60, 90]
@@ -370,6 +370,35 @@ header[data-testid="stHeader"]{background:transparent;}
 .st-key-mic_box{width:56px!important;flex:0 0 56px!important;}
 .st-key-mic_box [data-testid="stAudioInput"]{width:56px!important;min-width:56px!important;overflow:hidden!important;border-radius:999px!important;}
 .st-key-mic_box [data-testid="stAudioInput"]>div{width:56px!important;min-width:56px!important;height:52px;padding:0!important;justify-content:center!important;overflow:hidden!important;}
+/* 11/4 2차: 마이크 동그라미, 대화 머리줄, 회의록 요약 */
+.st-key-mic_box{width:56px!important;min-width:56px!important;flex:0 0 56px!important;}
+.st-key-mic_box [data-testid="stAudioInput"]{width:56px!important;min-width:56px!important;overflow:visible!important;}
+.st-key-mic_box [data-testid="stAudioInput"]>div:not([data-testid="stWidgetLabel"]){width:52px!important;min-width:52px!important;height:52px!important;min-height:52px!important;padding:0!important;margin:0 auto!important;
+  border-radius:999px!important;border:none!important;background:var(--primary)!important;display:flex!important;align-items:center!important;justify-content:center!important;overflow:hidden!important;}
+.st-key-mic_box [data-testid="stAudioInputWaveformTimeCode"],
+.st-key-mic_box div:has(> [data-testid="stAudioInputWaveSurfer"]),
+.st-key-mic_box [data-testid="stElementToolbar"]{display:none!important;}
+.st-key-mic_box [data-testid="stAudioInput"]>div:not([data-testid="stWidgetLabel"])>div{margin:0!important;padding:0!important;flex:0 0 auto!important;}
+.st-key-mic_box [data-testid="stAudioInputActionButton"]{width:52px!important;height:52px!important;color:#fff!important;border-radius:999px!important;}
+.st-key-mic_box [data-testid="stAudioInputActionButton"] *{color:#fff!important;}
+.st-key-mic_box [data-testid="stAudioInputActionButton"] svg{width:24px;height:24px;}
+.st-key-card_chat [data-testid="stHorizontalBlock"]:has(.st-key-mic_box){align-items:center!important;}
+.st-key-card_chat .stFormSubmitButton,.st-key-card_chat [data-testid="stElementContainer"]:has(.stFormSubmitButton){width:100%!important;}
+.st-key-card_chat .stFormSubmitButton>button{width:100%!important;min-height:52px;border-radius:999px;}
+.aivle-pill{display:inline-flex;align-items:center;height:30px;padding:0 12px;border-radius:999px;background:var(--tint);color:var(--primary-text);font-size:13px;font-weight:500;white-space:nowrap;}
+.st-key-chat_head,.st-key-sum_head{margin-bottom:6px;}
+.st-key-chat_head .stButton>button{min-height:30px;height:30px;padding:0 10px;border:none;background:transparent;color:var(--muted);font-size:13px;}
+.st-key-chat_head .stButton>button:hover{background:#FEE2E2;color:#B91C1C;}
+.st-key-card_summary{background:#fff;border-radius:24px;padding:22px 24px 26px!important;box-shadow:var(--shadow);box-sizing:border-box;}
+.st-key-card_summary textarea{font-size:14px!important;line-height:1.75!important;background:var(--tint2)!important;}
+.st-key-card_summary [data-baseweb="textarea"]{border-color:transparent!important;background:var(--tint2)!important;}
+.st-key-sum_actions{margin-top:8px;}
+.st-key-sum_actions .stButton>button,.st-key-sum_actions .stDownloadButton>button{min-height:44px;border-radius:12px;padding:0 18px;}
+.stDownloadButton>button{border-radius:12px;border:1px solid var(--border);background:#fff;color:var(--primary-text);font-size:14px;}
+.stDownloadButton>button:hover{border-color:var(--primary);color:var(--primary-text);background:var(--tint2);}
+[data-testid="stSidebar"] .st-key-nav_summary button[kind="primary"]{background:var(--primary);color:#fff;font-weight:500;}
+[data-testid="stSidebar"] .st-key-nav_summary button[kind="secondary"] [data-testid="stIconMaterial"]{color:var(--primary);}
+.st-key-card_upload [data-testid="stDateInput"]{max-width:240px;}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -491,6 +520,10 @@ DEFAULTS = {
     "cal_year": today.year,
     "cal_month": today.month,
     "confirm_reset": False,
+    "summary_text": None,        # 회의록 요약 (txt 저장 / 메일 발송용)
+    "summary_key": None,         # 어떤 회의록으로 만든 요약인지
+    "summary_rev": 0,            # 다시 요약할 때 text_area 키 갱신
+    "mic_n": 0,                  # 녹음을 처리하면 마이크를 새로 만들어 다시 누를 수 있게
     "notice": None,
 }
 for k, v in DEFAULTS.items():
@@ -1076,13 +1109,64 @@ def load_meeting(text, name, meeting_date, key):
         restore_task_statuses()
         n = len(tasks)
         brief_msg = (f"회의록을 읽었어요. 「{briefing['title']}」 회의에서 {USER_NAME}님께 업무 {n}건이 배정됐어요. "
-                     f"{briefing['summary']}" + (" 아래 업무를 눌러 자세히 보거나, 캘린더 추가와 메일 발송을 부탁해 주세요." if n else ""))
+                     f"{briefing['summary']}" + (" 아래 업무를 눌러 자세히 보거나, 캘린더 추가와 메일 발송을 명령해 주세요." if n else ""))
         append_assistant(brief_msg, show_tasks=bool(n))
         st.toast(f"회의록 분석 완료 — 업무 {n}건을 찾았어요")
         return True
     except Exception as e:
         set_notice("error", f"회의록 분석에 실패했어요: {e} — 잠시 후 '다시 분석'을 눌러 주세요.")
         return False
+
+
+# ---- (a2) 회의록 요약 (txt 저장 / 메일 발송용) ----
+SUMMARY_PROMPT = f"""당신은 마케팅팀 '{USER_NAME}'의 음성인식 AI 개인비서 '에이블'입니다.
+{USER_NAME}가 요청한 업무를 최선을 다해 처리합니다.
+
+[{USER_NAME} 정보]
+- 소속: 마케팅팀 (Marketing Data Analyst)
+- 담당: 마케팅 전략 분석, 콘텐츠 기획, 데이터 기반 의사결정 지원
+- 잦은 외부 미팅으로 회의에 참석하지 못하는 경우가 많습니다.
+
+[에이블의 담당 업무]
+1. 회의록 분석 및 요약
+2. {USER_NAME}에게 배정된 업무 지시사항 추출
+3. {USER_NAME}의 다양한 질문에 대한 응답
+4. {USER_NAME}가 요청할 때만 이메일 발송
+
+[답변 원칙]
+1. 정중한 존댓말로 답합니다.
+2. 근거가 없는 내용은 지어내지 않고, 정해지지 않은 사항은 '미정'이라고 표시합니다.
+3. 금액, 날짜, 기간, 수량, 비율 같은 숫자 정보는 원문 그대로 빠짐없이 적습니다.
+4. 결정된 내용뿐 아니라 그렇게 결정한 이유와 근거도 함께 적습니다.
+
+[회의록 요약 원칙]
+회의록 요약을 요청받으면, 회의에 참석하지 못한 {USER_NAME}가 이것만 읽고 바로 업무를 시작할 수 있도록
+중요한 정보를 빠뜨리지 않고 자세하게 다음 순서로 정리합니다. 회의에서 다루지 않은 항목은 생략합니다.
+
+1. 회의 개요: 회의 주제와 목적을 한두 문장으로 정리
+2. {USER_NAME}에게 배정된 업무 (가장 자세하게, 하나도 빠짐없이)
+   - 업무마다 업무 내용, 배경과 목적, 구체적 범위(채널, 대상, 참고 사례 등), 결과물 형태,
+     마감일, 요청한 사람, 회의에서 강조된 점, 바로 시작할 첫 행동
+   - 마감일은 업무마다 회의록에서 그 업무에 대해 직접 언급된 것만 적고, 없으면 '미정'으로 적기
+   - 배정된 업무가 없으면 '배정된 업무 없음'이라고 적기
+3. 마케팅 주요 논의 내용 (항목별 결정 사항과 이유)
+   - 목표와 성과 지표, 타겟 고객, 전략과 방향, 채널별 활용 계획과 선택 이유,
+     콘텐츠 방향, 경쟁사 및 시장 동향, 예산, 일정, 프로모션과 이벤트, 협업 사항
+4. 다른 팀원의 업무
+5. 정리: 결정된 사항, 미정 사항, 다음 일정
+6. 참석자별 주요 발언 (마지막에 간략하게)
+
+[출력 형식]
+txt 파일로 저장하고 메일 본문으로 보낼 문서입니다. 마크다운 기호(#, *, **, 표)를 쓰지 말고,
+'1. 회의 개요' 같은 번호 제목과 '-' 목록, 들여쓰기만 사용합니다."""
+
+
+def generate_summary(meeting_text, meeting_date):
+    """회의록 → 김 대리용 상세 요약 텍스트 (LLM)"""
+    user = f"회의 날짜: {meeting_date}\n\n[회의록]\n{meeting_text}\n\n위 회의록을 요약 원칙에 따라 정리해 주세요."
+    response = client.responses.create(model=LLM_MODEL, temperature=0,
+                                       input=[{"role": "system", "content": SUMMARY_PROMPT}, {"role": "user", "content": user}])
+    return (response.output_text or "").strip()
 
 
 # ---- (b) 업무 초안 작성 ----
@@ -1831,6 +1915,8 @@ def render_sidebar(ctx):
             n_tasks = len(st.session_state.tasks)
             if st.button(PAGES["assistant"], key="nav_assistant", icon=":material/forum:", type="primary" if page == "assistant" else "secondary"):
                 go("assistant")
+            if st.button(PAGES["summary"], key="nav_summary", icon=":material/summarize:", type="primary" if page == "summary" else "secondary"):
+                go("summary")
             if st.button(PAGES["tasks"] + (f"  ({n_tasks})" if n_tasks else ""), key="nav_tasks", icon=":material/task_alt:", type="primary" if page == "tasks" else "secondary"):
                 go("tasks")
             if st.button(PAGES["calendar"], key="nav_calendar", icon=":material/calendar_month:", type="primary" if page == "calendar" else "secondary"):
@@ -1902,7 +1988,7 @@ def render_meeting_strip(ctx):
         return
 
     with st.container(key="card_upload"):
-        u1, u2 = st.columns(2, vertical_alignment="top")
+        u1, u2 = st.columns([2.4, 1], vertical_alignment="top", gap="medium")
         uploaded = u1.file_uploader("회의록 파일(.txt) 올리기", type=["txt"], key="uploader")
         meeting_date_input = u2.date_input("회의 날짜", value=parse_iso(st.session_state.meeting_date) or today, format="YYYY-MM-DD")
         if has_meeting and st.button("닫기", key="btn_close_uploader"):
@@ -1935,6 +2021,19 @@ def render_assistant(ctx):
         incoming, st.session_state.prefill = st.session_state.prefill, None
 
     with st.container(key="card_chat"):
+        # (0) 머리줄: 제목 · 대화 기억 배지 · 대화 비우기 (오른쪽 끝)
+        with st.container(horizontal=True, vertical_alignment="center", key="chat_head"):
+            st.markdown(f'<span class="aivle-card-title" style="margin:0">{APP_NAME}와 대화</span>', unsafe_allow_html=True)
+            st.space("stretch")
+            st.markdown(f'<span class="aivle-pill">대화 기억 {count_turns(st.session_state.messages)} / {MAX_TURNS}턴</span>', unsafe_allow_html=True)
+            if st.button("대화 비우기", key="btn_clear", icon=":material/delete_sweep:", type="tertiary"):
+                st.session_state.messages = []
+                st.session_state.pending_actions = []
+                st.session_state.tts_audio = None
+                st.session_state.tts_autoplay = False
+                st.toast("대화를 비웠어요.")
+                st.rerun()
+
         # (1) 대화 기록 — 오래된 것부터, 최신이 아래 (자동 스크롤)
         history_box = st.container(height=400, border=False, autoscroll=True)
         with history_box:
@@ -1942,7 +2041,7 @@ def render_assistant(ctx):
             if not msgs:
                 st.markdown(f'<div class="aivle-msg-a"><span class="aivle-msg-label">{APP_NAME}</span><div class="aivle-bubble-a">'
                             f'안녕하세요, {APP_NAME}이에요. 위에서 회의록을 올리면 요약하고 {USER_NAME}님 업무를 정리해 드릴게요. '
-                            '아래 마이크나 입력창으로 부탁해 주세요.</div></div>', unsafe_allow_html=True)
+                            '아래 마이크나 입력창으로 명령해 주세요.</div></div>', unsafe_allow_html=True)
             for m in msgs:
                 render_message(m)
                 # 스피커로 요청한 답변만, 플레이어 없이 재생 (멈추면 요소를 지워 소리 정지)
@@ -1962,15 +2061,15 @@ def render_assistant(ctx):
             incoming = "이번 주 일정 알려줘"
 
         # (3) 작성기: 마이크 + 텍스트 + 전송 (한 줄)
-        cm, cf = st.columns([0.45, 6], vertical_alignment="center", gap="small")
+        cm, cf = st.columns([0.5, 9], vertical_alignment="center", gap="small")
         with cm:
             with st.container(key="mic_box"):
-                audio_value = st.audio_input("눌러서 말하기", key="mic", label_visibility="collapsed")
+                audio_value = st.audio_input("눌러서 말하기", key=f"mic_{st.session_state.mic_n}", label_visibility="collapsed")
         with cf:
             with st.form("msg_form", clear_on_submit=True, border=False):
-                f1, f2 = st.columns([5, 1], vertical_alignment="center", gap="small")
-                typed = f1.text_input("글로 부탁하기", placeholder=f"{APP_NAME}에게 글로 부탁하기 (예: 팀장님께 업무 정리 메일 보내줘)", label_visibility="collapsed")
-                sent = f2.form_submit_button("전송")
+                f1, f2 = st.columns([8, 1], vertical_alignment="center", gap="small")
+                typed = f1.text_input("명령 입력", placeholder=f"{APP_NAME}에게 명령하기 (예: 팀장님께 업무 정리 메일 보내줘)", label_visibility="collapsed")
+                sent = f2.form_submit_button("전송", width="stretch")
         if sent and typed.strip():
             incoming, incoming_via = typed, "text"
 
@@ -1980,6 +2079,7 @@ def render_assistant(ctx):
             audio_hash = hashlib.md5(audio_bytes).hexdigest()
             if audio_hash != st.session_state.last_audio_hash:
                 st.session_state.last_audio_hash = audio_hash
+                st.session_state.mic_n += 1                     # 다음 실행에서 마이크를 새로 (재생 버튼 대신 마이크)
                 if client is None:
                     set_notice("note", "OPENAI_API_KEY 가 없어 음성을 인식할 수 없어요. (사이드바 '설정 안내' 참고)")
                 else:
@@ -1994,18 +2094,57 @@ def render_assistant(ctx):
                     except Exception as e:
                         set_notice("error", f"음성 인식에 실패했어요: {e} — 다시 녹음해 주세요.")
 
-        z1, z2 = st.columns([4, 1.2], vertical_alignment="center")
-        z1.markdown(f'<p class="aivle-hint">대화 기록 {count_turns(st.session_state.messages)} / {MAX_TURNS}턴 유지</p>', unsafe_allow_html=True)
-        if z2.button("대화 비우기", key="btn_clear"):
-            st.session_state.messages = []
-            st.session_state.pending_actions = []
-            st.session_state.tts_audio = None
-            st.session_state.tts_autoplay = False
-            st.toast("대화를 비웠어요.")
-            st.rerun()
-
         if incoming:                                                # 버튼 / 텍스트 / 음성 / 다른 페이지에서 넘어온 문장
             handle_user_message(incoming, incoming_via, pending_slot.container())
+
+
+def render_summary(ctx):
+    """페이지: 회의록 요약 — 회의록 카드 → 요약 카드(수정 가능) → [다시 요약] [txt로 저장] [메일로 보내기]"""
+    render_meeting_strip(ctx)
+    if not ctx["has_meeting"]:
+        return
+    key = st.session_state.briefing_key
+    with st.container(key="card_summary"):
+        with st.container(horizontal=True, vertical_alignment="center", key="sum_head"):
+            st.markdown('<span class="aivle-card-title" style="margin:0">회의록 요약</span>', unsafe_allow_html=True)
+            st.space("stretch")
+            st.markdown(f'<span class="aivle-pill">{esc(st.session_state.meeting_name)} · {fmt_kor_day(st.session_state.meeting_date)}</span>',
+                        unsafe_allow_html=True)
+
+        if st.session_state.summary_key != key or st.session_state.summary_text is None:
+            if client is None:
+                st.session_state.summary_text = ""
+                set_notice("note", "OPENAI_API_KEY 가 없어 요약을 만들 수 없어요. (사이드바 '설정 안내' 참고)")
+            else:
+                try:
+                    with st.spinner("회의록을 정리하는 중…"):
+                        st.session_state.summary_text = generate_summary(st.session_state.meeting_text, st.session_state.meeting_date)
+                    st.toast("회의록 요약을 만들었어요.")
+                except Exception as e:
+                    st.session_state.summary_text = ""
+                    set_notice("error", f"요약에 실패했어요: {e} — '다시 요약'을 눌러 주세요.")
+            st.session_state.summary_key = key
+            render_notice()
+
+        text = st.text_area("요약 (수정 가능)", value=st.session_state.summary_text or "", height=520,
+                            key=f"sum_ta_{st.session_state.summary_rev}", label_visibility="collapsed")
+        st.session_state.summary_text = text
+
+        stem = os.path.splitext(st.session_state.meeting_name or "meeting")[0]
+        fname = f"{st.session_state.meeting_date}_{stem}_요약.txt"
+        with st.container(horizontal=True, horizontal_alignment="right", vertical_alignment="center", gap="small", key="sum_actions"):
+            if st.button("다시 요약", key="btn_sum_again", icon=":material/refresh:", disabled=client is None):
+                st.session_state.summary_text = None
+                st.session_state.summary_rev += 1
+                st.rerun()
+            st.download_button("txt로 저장", data=(text or "").encode("utf-8"), file_name=fname, mime="text/plain",
+                               key="btn_sum_txt", icon=":material/download:", disabled=not text.strip())
+            if st.button("메일로 보내기", key="btn_sum_mail", icon=":material/send:", type="primary", disabled=not text.strip()):
+                b = st.session_state.briefing
+                title = b["title"] if b else stem
+                queue_pending("send_email", {"to": MY_EMAIL, "subject": f"[회의록 요약] {title} ({st.session_state.meeting_date})",
+                                             "body": text})
+                st.rerun()
 
 
 def render_tasks(ctx):
@@ -2267,7 +2406,9 @@ def main():
     page = st.session_state.page
     if not ctx["is_owner"] and page not in ("requests", "calendar"):
         page = st.session_state.page = "requests"
-    if page == "tasks":
+    if page == "summary":
+        render_summary(ctx)
+    elif page == "tasks":
         render_tasks(ctx)
     elif page == "calendar":
         render_calendar(ctx)
