@@ -399,6 +399,26 @@ header[data-testid="stHeader"]{background:transparent;}
 [data-testid="stSidebar"] .st-key-nav_summary button[kind="primary"]{background:var(--primary);color:#fff;font-weight:500;}
 [data-testid="stSidebar"] .st-key-nav_summary button[kind="secondary"] [data-testid="stIconMaterial"]{color:var(--primary);}
 .st-key-card_upload [data-testid="stDateInput"]{max-width:240px;}
+/* 11/4 3차: 캘린더 칸 — 버튼이 툴팁 래퍼 안에 있어 자손 선택자로 강제 */
+[class*="st-key-cell_"],[class*="st-key-cellt_"]{display:flex!important;flex-direction:column!important;flex-wrap:nowrap!important;justify-content:flex-start!important;gap:3px!important;height:118px!important;min-height:118px!important;overflow:hidden!important;}
+[class*="st-key-cell_"]>*,[class*="st-key-cellt_"]>*{flex:0 0 auto!important;min-height:0!important;margin:0!important;}
+[class*="st-key-cell_"] .aivle-daynum,[class*="st-key-cellt_"] .aivle-daynum{display:block;height:18px;line-height:18px;margin:0 0 2px 2px;}
+[class*="st-key-cell_"] .stButton,[class*="st-key-cellt_"] .stButton,
+[class*="st-key-cell_"] .stButton div,[class*="st-key-cellt_"] .stButton div{width:100%!important;max-width:100%!important;min-width:0!important;}
+[class*="st-key-cell_"] .stButton button,[class*="st-key-cellt_"] .stButton button{height:20px!important;min-height:20px!important;max-height:20px!important;padding:0 6px!important;border-radius:6px!important;
+  width:100%!important;justify-content:flex-start!important;overflow:hidden!important;line-height:20px!important;}
+[class*="st-key-cell_"] .stButton button *,[class*="st-key-cellt_"] .stButton button *{font-size:10.5px!important;line-height:20px!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;margin:0!important;text-align:left!important;}
+.aivle-more{display:block;font-size:10.5px!important;line-height:14px!important;}
+/* 회의록 카드 */
+.st-key-meeting_row [data-testid="stMarkdownContainer"] p{margin:0;}
+.st-key-meeting_row .stButton button{min-height:44px;border-radius:12px;white-space:nowrap;}
+/* AIVLE 라벨 바로 옆 스피커 (같은 줄, 세로 가운데) */
+[class*="st-key-ahead_"]{display:flex!important;flex-direction:row!important;align-items:center!important;justify-content:flex-start!important;gap:2px!important;height:28px;margin-top:6px;}
+[class*="st-key-ahead_"]>*{flex:0 0 auto!important;width:auto!important;min-width:0!important;margin:0!important;}
+[class*="st-key-ahead_"] .stMarkdown,[class*="st-key-ahead_"] [data-testid="stMarkdownContainer"],[class*="st-key-ahead_"] [data-testid="stMarkdownContainer"] p{margin:0!important;padding:0!important;line-height:28px!important;}
+[class*="st-key-ahead_"] .aivle-msg-label{display:inline-block;line-height:28px;}
+[class*="st-key-ahead_"] .stButton button{width:26px!important;height:26px!important;min-height:26px!important;padding:0!important;margin:0!important;}
+[class*="st-key-ahead_"] .stButton button [data-testid="stIconMaterial"]{font-size:18px!important;}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -799,7 +819,7 @@ def chip_style(ev):
     return "A" if ev.get("source") == "able" else "C"
 
 
-def chip_label(ev, width=11):
+def chip_label(ev, width=18):
     style = chip_style(ev)
     title = ev.get("subject") if ev.get("kind") == "request" else ev.get("title", "")
     title = title or ""
@@ -1103,15 +1123,11 @@ def load_meeting(text, name, meeting_date, key):
         set_notice("note", "OPENAI_API_KEY 가 없어 회의록 분석은 건너뛰었어요. 회의록 원문은 기억해 둘게요. (사이드바 '설정 안내' 참고)")
         return False
     try:
-        with st.spinner(f"회의록을 읽고 {USER_NAME}님 업무를 찾는 중…"):
+        with st.spinner("회의록을 불러오는 중…"):
             briefing, tasks = extract_briefing(text, meeting_date)
         st.session_state.briefing, st.session_state.tasks = briefing, tasks
         restore_task_statuses()
-        n = len(tasks)
-        brief_msg = (f"회의록을 읽었어요. 「{briefing['title']}」 회의에서 {USER_NAME}님께 업무 {n}건이 배정됐어요. "
-                     f"{briefing['summary']}" + (" 아래 업무를 눌러 자세히 보거나, 캘린더 추가와 메일 발송을 명령해 주세요." if n else ""))
-        append_assistant(brief_msg, show_tasks=bool(n))
-        st.toast(f"회의록 분석 완료 — 업무 {n}건을 찾았어요")
+        st.toast(f"회의록을 불러왔어요 · {briefing['title']}")
         return True
     except Exception as e:
         set_notice("error", f"회의록 분석에 실패했어요: {e} — 잠시 후 '다시 분석'을 눌러 주세요.")
@@ -1978,13 +1994,14 @@ def render_meeting_strip(ctx):
         b = st.session_state.briefing
         title = f" · {b['title']}" if b else ""
         with st.container(key="card_meeting"):
-            c1, c2 = st.columns([3, 1.1], vertical_alignment="center")
-            c1.markdown('<p class="aivle-eyebrow">지금 읽고 있는 회의록</p>'
-                        f'<p class="aivle-strong">{esc(st.session_state.meeting_name)}{esc(title)} · {fmt_kor_day(st.session_state.meeting_date)}</p>',
-                        unsafe_allow_html=True)
-            if c2.button("다른 회의록 올리기", key="btn_other_meeting"):
-                st.session_state.show_uploader = True
-                st.rerun()
+            with st.container(horizontal=True, vertical_alignment="center", key="meeting_row"):
+                st.markdown('<p class="aivle-eyebrow">지금 읽고 있는 회의록</p>'
+                            f'<p class="aivle-strong">{esc(st.session_state.meeting_name)}{esc(title)} · {fmt_kor_day(st.session_state.meeting_date)}</p>',
+                            unsafe_allow_html=True)
+                st.space("stretch")
+                if st.button("다른 회의록 올리기", key="btn_other_meeting", icon=":material/upload_file:"):
+                    st.session_state.show_uploader = True
+                    st.rerun()
         return
 
     with st.container(key="card_upload"):
@@ -2095,7 +2112,7 @@ def render_assistant(ctx):
                         set_notice("error", f"음성 인식에 실패했어요: {e} — 다시 녹음해 주세요.")
 
         if incoming:                                                # 버튼 / 텍스트 / 음성 / 다른 페이지에서 넘어온 문장
-            handle_user_message(incoming, incoming_via, pending_slot.container())
+            handle_user_message(incoming, incoming_via, history_box)
 
 
 def render_summary(ctx):
