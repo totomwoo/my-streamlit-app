@@ -21,6 +21,7 @@ import calendar as cal_lib
 from datetime import date, datetime, time, timedelta, timezone
 from email.mime.text import MIMEText
 from urllib.parse import quote
+from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -419,6 +420,10 @@ header[data-testid="stHeader"]{background:transparent;}
 [class*="st-key-ahead_"] .aivle-msg-label{display:inline-block;line-height:28px;}
 [class*="st-key-ahead_"] .stButton button{width:26px!important;height:26px!important;min-height:26px!important;padding:0!important;margin:0!important;}
 [class*="st-key-ahead_"] .stButton button [data-testid="stIconMaterial"]{font-size:18px!important;}
+/* 캘린더 날짜: 칸 왼쪽 위에 고정, 칩은 그 아래부터 */
+[class*="st-key-cell_"],[class*="st-key-cellt_"]{position:relative!important;padding:26px 6px 4px!important;}
+[class*="st-key-cell_"] [data-testid="stElementContainer"]:has(.aivle-daynum),[class*="st-key-cellt_"] [data-testid="stElementContainer"]:has(.aivle-daynum){position:absolute!important;top:5px;left:8px;width:auto!important;height:18px!important;margin:0!important;z-index:1;}
+[class*="st-key-cell_"] .aivle-daynum,[class*="st-key-cellt_"] .aivle-daynum{margin:0!important;line-height:18px!important;white-space:nowrap;}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -1123,9 +1128,17 @@ def load_meeting(text, name, meeting_date, key):
         set_notice("note", "OPENAI_API_KEY 가 없어 회의록 분석은 건너뛰었어요. 회의록 원문은 기억해 둘게요. (사이드바 '설정 안내' 참고)")
         return False
     try:
-        with st.spinner("회의록을 불러오는 중…"):
+        with st.spinner("회의록을 읽고 요약하는 중…"), ThreadPoolExecutor(max_workers=1) as pool:
+            summary_job = pool.submit(generate_summary, text, meeting_date.isoformat())   # 요약은 옆에서 동시에
             briefing, tasks = extract_briefing(text, meeting_date)
+            try:
+                summary = summary_job.result()
+            except Exception:
+                summary = None                                    # 요약 탭에서 다시 시도
         st.session_state.briefing, st.session_state.tasks = briefing, tasks
+        st.session_state.summary_text = summary
+        st.session_state.summary_key = key if summary else None
+        st.session_state.summary_rev += 1
         restore_task_statuses()
         st.toast(f"회의록을 불러왔어요 · {briefing['title']}")
         return True
