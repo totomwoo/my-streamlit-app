@@ -354,9 +354,22 @@ header[data-testid="stHeader"]{background:transparent;}
 [class*="st-key-cell_"] [data-testid="stMarkdownContainer"] p,[class*="st-key-cellt_"] [data-testid="stMarkdownContainer"] p{margin:0;}
 .aivle-more{font-size:11px;font-weight:700;color:var(--primary-text);margin:0 0 0 4px;line-height:14px;}
 /* 다이얼로그 버튼: 위 구분선과 간격, 칸 꽉 채움 */
-[data-testid="stDialog"] [data-testid="stHorizontalBlock"]{margin-top:18px;}
-[data-testid="stDialog"] .stButton,[data-testid="stDialog"] .stButton>button{width:100%;}
-[data-testid="stDialog"] .stButton>button{min-height:46px;}
+[data-testid="stDialog"] [data-testid="stHorizontalBlock"]{margin-top:20px;}
+[data-testid="stDialog"] [data-testid="stColumn"] [data-testid="stElementContainer"]:has(.stButton),
+[data-testid="stDialog"] [data-testid="stColumn"] .stButton,[data-testid="stDialog"] [data-testid="stColumn"] .stButton>button{width:100%!important;}
+[data-testid="stDialog"] .stButton>button{min-height:44px;}
+/* 내 업무 2x2 / 다가오는 일정 / 캘린더 칩: 칸 꽉 채움 (Streamlit 인라인 폭 덮어쓰기) */
+.st-key-page_tasks [data-testid="stColumn"] [data-testid="stElementContainer"]:has(.stButton),
+.st-key-page_tasks [data-testid="stColumn"] .stButton,.st-key-page_tasks [data-testid="stColumn"] .stButton>button,
+.st-key-card_upcoming [data-testid="stElementContainer"]:has(.stButton),.st-key-card_upcoming .stButton,.st-key-card_upcoming .stButton>button,
+.st-key-card_sent [data-testid="stElementContainer"]:has(.stButton),.st-key-card_sent .stButton,.st-key-card_sent .stButton>button,
+[class*="st-key-cell_"] [data-testid="stElementContainer"]:has(.stButton),[class*="st-key-cellt_"] [data-testid="stElementContainer"]:has(.stButton){width:100%!important;max-width:100%!important;}
+.st-key-card_upcoming .stButton>button,.st-key-card_sent .stButton>button{justify-content:flex-start;}
+.aivle-card-title{font-size:18px;font-weight:700;margin:0 0 14px;}
+/* 마이크: 동그란 버튼만 보이게 */
+.st-key-mic_box{width:56px!important;flex:0 0 56px!important;}
+.st-key-mic_box [data-testid="stAudioInput"]{width:56px!important;min-width:56px!important;overflow:hidden!important;border-radius:999px!important;}
+.st-key-mic_box [data-testid="stAudioInput"]>div{width:56px!important;min-width:56px!important;height:52px;padding:0!important;justify-content:center!important;overflow:hidden!important;}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -1272,6 +1285,7 @@ def handle_user_message(text, via, box):
     text = (text or "").strip()
     if not text:
         return
+    st.session_state.tts_autoplay = False                 # 새 질문을 하면 읽던 음성은 멈춤
     user_msg = new_message("user", text, via=via)
     st.session_state.messages.append(user_msg)
     assistant_id = uuid.uuid4().hex[:8]
@@ -1455,6 +1469,12 @@ def decide_request(ev, decision, by, reason=""):
 # 6) 다이얼로그 (한 실행에 하나만 연다)
 #    - 대기열/상태가 있으면 매 실행마다 열어 준다. 결정 후 st.rerun() 으로 닫는다.
 # =========================================================
+def right_row(n):
+    """버튼 n개를 오른쪽 끝에 모으는 칸. 반환 순서: 첫 번째(주 버튼)가 가장 오른쪽"""
+    cols = st.columns([5 - n] + [1.2] * n, gap="small", vertical_alignment="center")
+    return list(reversed(cols[1:]))
+
+
 def dlg_row(key, value):
     st.markdown(f'<div class="aivle-dlg-row"><span class="aivle-dlg-k">{esc(key)}</span><span class="aivle-dlg-v">{esc(value)}</span></div>',
                 unsafe_allow_html=True)
@@ -1498,7 +1518,7 @@ def calendar_dialog():
             dlg_row("날짜", fmt_long_kor(date_iso))
         dlg_row("메모", args.get("description", ""))
 
-        b1, b2, b3 = st.columns([1.4, 1, 1])
+        b1, b2, b3 = right_row(3)
         if b1.button("추가", key=f"dlg_add_{aid}", type="primary"):
             execute_calendar(action, args.get("title"), date_iso, args.get("description"))
             st.rerun()
@@ -1516,7 +1536,7 @@ def calendar_dialog():
         title = st.text_input("일정 제목", value=args.get("title", ""), key=f"dlg_etitle_{aid}")
         d = st.date_input("날짜", value=parse_iso(args.get("date")) or today, key=f"dlg_edate_{aid}", format="YYYY-MM-DD")
         desc = st.text_area("메모", value=args.get("description", ""), height=120, key=f"dlg_edesc_{aid}")
-        b1, b2 = st.columns([1.4, 1])
+        b1, b2 = right_row(2)
         if b1.button("저장하고 추가", key=f"dlg_save_{aid}", type="primary"):
             st.session_state.dlg_mode = "summary"
             execute_calendar(action, title, d.isoformat(), desc)
@@ -1539,7 +1559,7 @@ def email_dialog():
         dlg_row("받는 사람", f"{args.get('to_label')} <{args.get('to_email')}>")
         dlg_row("제목", args.get("subject", ""))
         dlg_row("본문", args.get("body", ""))
-        b1, b2, b3 = st.columns([1.4, 1, 1])
+        b1, b2, b3 = right_row(3)
         if b1.button("보내기", key=f"dlg_send_{aid}", type="primary"):
             execute_email(action, args.get("to_label"), args.get("to_email"), args.get("subject", ""), args.get("body", ""))
             st.rerun()
@@ -1560,7 +1580,7 @@ def email_dialog():
             to_label, to_email = pick, CONTACT_EMAIL[pick]
         subject = st.text_input("제목", value=args.get("subject", ""), key=f"dlg_esubject_{aid}")
         body = st.text_area("본문", value=args.get("body", ""), height=220, key=f"dlg_ebody_{aid}")
-        b1, b2 = st.columns([1.4, 1])
+        b1, b2 = right_row(2)
         if b1.button("저장하고 보내기", key=f"dlg_save_{aid}", type="primary"):
             st.session_state.dlg_mode = "summary"
             args.update(to_label=to_label, to_email=to_email, subject=subject, body=body)
@@ -1653,7 +1673,7 @@ def request_dialog():
         dlg_row("일시", f"{fmt_kor_day(form['date'])} {form['start']}~{end_time_of(form['start'], form['duration'])} ({form['duration']}분)")
         dlg_row("관련 업무", form["subject"])
         dlg_row("메시지", form["message"])
-        b1, b2, b3 = st.columns([1.4, 1, 1])
+        b1, b2, b3 = right_row(3)
         if b1.button("보내기", key="rq_send", type="primary", disabled=not form["to"]):
             send_request(form)
             close_request()
@@ -1673,7 +1693,7 @@ def request_dialog():
         t = c2.time_input("시작 시간", value=time(h, m), step=timedelta(minutes=30), key="rq_start")
         dur = c3.selectbox("소요 시간", DURATIONS, index=DURATIONS.index(form["duration"]), format_func=lambda x: f"{x}분", key="rq_dur")
         msg = st.text_area("메시지", value=form["message"], height=180, key="rq_msg")
-        b1, b2 = st.columns([1.4, 1])
+        b1, b2 = right_row(2)
         if b1.button("저장", key="rq_save", type="primary"):
             form.update(to=to, type=rtype, date=d.isoformat(), start=t.strftime("%H:%M"), duration=dur, message=msg)
             st.session_state.request_mode = "summary"
@@ -1769,9 +1789,14 @@ def render_message(m):
         tools_html = "".join(f'<span class="aivle-tool">— {esc(line)}</span>' for line in tool_lines(m.get("tools")))
         with st.container(horizontal=True, vertical_alignment="center", gap="small", key=f"ahead_{m['id']}"):
             st.markdown(f'<span class="aivle-msg-label">{APP_NAME}</span>', unsafe_allow_html=True)
-            if st.button("", key=f"spk_{m['id']}", icon=":material/volume_up:", type="tertiary", help="음성으로 듣기"):
-                st.session_state.tts_for = m["id"]
-                speak(m["content"])
+            playing = st.session_state.get("tts_for") == m["id"] and st.session_state.tts_autoplay
+            if st.button("", key=f"spk_{m['id']}", icon=":material/stop_circle:" if playing else ":material/volume_up:",
+                         type="tertiary", help="읽기 멈추기" if playing else "음성으로 듣기"):
+                if playing:                                   # 다시 누르면 멈춤 (오디오 요소를 지움)
+                    st.session_state.tts_autoplay = False
+                else:
+                    st.session_state.tts_for = m["id"]
+                    speak(m["content"])
                 st.rerun()
         st.markdown(f'<div class="aivle-msg-a" style="margin-top:0"><div class="aivle-bubble-a">{esc(m["content"])}{tools_html}</div></div>',
                     unsafe_allow_html=True)
@@ -1920,11 +1945,10 @@ def render_assistant(ctx):
                             '아래 마이크나 입력창으로 부탁해 주세요.</div></div>', unsafe_allow_html=True)
             for m in msgs:
                 render_message(m)
-                # 스피커 버튼으로 요청한 답변만, 플레이어 없이 한 번 재생
+                # 스피커로 요청한 답변만, 플레이어 없이 재생 (멈추면 요소를 지워 소리 정지)
                 if st.session_state.get("tts_for") == m["id"] and st.session_state.tts_audio and st.session_state.tts_autoplay:
                     b64 = base64.b64encode(st.session_state.tts_audio).decode("ascii")
                     st.markdown(f'<audio autoplay src="data:audio/mp3;base64,{b64}" style="display:none"></audio>', unsafe_allow_html=True)
-                    st.session_state.tts_autoplay = False
 
         # (2) 예시 명령 (회의록이 필요한 것은 없으면 비활성)
         q1, q2, q3, q4 = st.columns(4)
@@ -1938,7 +1962,7 @@ def render_assistant(ctx):
             incoming = "이번 주 일정 알려줘"
 
         # (3) 작성기: 마이크 + 텍스트 + 전송 (한 줄)
-        cm, cf = st.columns([1.4, 4], vertical_alignment="center", gap="small")
+        cm, cf = st.columns([0.45, 6], vertical_alignment="center", gap="small")
         with cm:
             with st.container(key="mic_box"):
                 audio_value = st.audio_input("눌러서 말하기", key="mic", label_visibility="collapsed")
@@ -2051,30 +2075,30 @@ def render_tasks(ctx):
                     r2a, r2b = st.columns(2, gap="small")
                     with r1a:
                         if status == "todo":
-                            if st.button("캘린더에 추가", key=f"btn_add_{t['id']}", type="primary"):
+                            if st.button("캘린더에 추가", key=f"btn_add_{t['id']}", type="primary", width="stretch"):
                                 queue_task(t)
                                 st.rerun()
                         elif t.get("event_id"):
-                            if st.button("✓ 캘린더 보기", key=f"btn_seecal_{t['id']}"):
+                            if st.button("✓ 캘린더 보기", key=f"btn_seecal_{t['id']}", width="stretch"):
                                 d = parse_iso(t["due"]) or today
                                 go("calendar", cal_year=d.year, cal_month=d.month)
                         else:
                             st.markdown('<span class="aivle-done">✓ 완료</span>', unsafe_allow_html=True)
                     with r1b:
-                        if st.button(f"{APP_NAME}에게 초안 맡기기" if t["id"] not in st.session_state.drafts else "초안 보기", key=f"btn_draft_{t['id']}"):
+                        if st.button(f"{APP_NAME}에게 초안 맡기기" if t["id"] not in st.session_state.drafts else "초안 보기", key=f"btn_draft_{t['id']}", width="stretch"):
                             st.session_state.draft_task = t["id"]
                             st.rerun()
                     with r2a:
                         if status != "done":
-                            if st.button("완료", key=f"btn_done_{t['id']}"):
+                            if st.button("완료", key=f"btn_done_{t['id']}", width="stretch"):
                                 mark_task_done(t, True)
                                 st.toast(f"'{t['title']}' 완료로 표시했어요.")
                                 st.rerun()
-                        elif st.button("완료 취소", key=f"btn_undone_{t['id']}"):
+                        elif st.button("완료 취소", key=f"btn_undone_{t['id']}", width="stretch"):
                             mark_task_done(t, False)
                             st.rerun()
                     with r2b:
-                        if st.button("협업·미팅 요청", key=f"btn_req_{t['id']}"):
+                        if st.button("협업·미팅 요청", key=f"btn_req_{t['id']}", width="stretch"):
                             open_request(task=t)
                             st.rerun()
 
@@ -2117,20 +2141,20 @@ def render_calendar(ctx):
                             with st.container(key=(f"cellt_{cell['iso']}" if cell["is_today"] else f"cell_{cell['iso']}")):
                                 st.markdown(f'<span class="aivle-daynum">{cell["day"]}{" 오늘" if cell["is_today"] else ""}</span>', unsafe_allow_html=True)
                                 for ev in cell["chips"]:
-                                    if st.button(chip_label(ev), key=f"ev{chip_style(ev)}_{cell['iso']}_{ev['id']}", help=ev["title"]):
+                                    if st.button(chip_label(ev), key=f"ev{chip_style(ev)}_{cell['iso']}_{ev['id']}", help=ev["title"], wrap=False, width="stretch"):
                                         st.session_state.open_event = ev["id"]
                                         st.rerun()
                                 if cell["more"]:
                                     st.markdown(f'<span class="aivle-more">+{cell["more"]}</span>', unsafe_allow_html=True)
         with u:
             with st.container(key="card_upcoming"):
-                st.markdown('<p class="aivle-strong" style="font-size:18px">다가오는 일정</p>', unsafe_allow_html=True)
+                st.markdown('<p class="aivle-card-title">다가오는 일정</p>', unsafe_allow_html=True)
                 upcoming = [e for e in ctx["all_events"] if today.isoformat() <= e["date"] <= (today + timedelta(days=30)).isoformat()][:8]
                 if not upcoming:
                     st.markdown('<p class="aivle-hint">다가오는 일정이 없어요.</p>', unsafe_allow_html=True)
                 for ev in upcoming:
                     if st.button(f"{fmt_short(ev['date'])} · {chip_label(ev, 40)}" + (f" · {ev['start_time']}" if ev.get("start_time") else ""),
-                                 key=f"up_{ev['id']}"):
+                                 key=f"up_{ev['id']}", wrap=False, width="stretch"):
                         st.session_state.open_event = ev["id"]
                         st.rerun()
                 if is_owner and st.button("내 업무로 가기", key="btn_go_tasks"):
@@ -2139,13 +2163,13 @@ def render_calendar(ctx):
             if is_owner:
                 sent_reqs = [e for e in ctx["all_events"] if e.get("kind") == "request" and e.get("from") == USER_NAME]
                 with st.container(key="card_sent"):
-                    st.markdown('<p class="aivle-strong" style="font-size:18px">보낸 요청</p>', unsafe_allow_html=True)
+                    st.markdown('<p class="aivle-card-title">보낸 요청</p>', unsafe_allow_html=True)
                     if not sent_reqs:
                         st.markdown('<p class="aivle-hint">보낸 요청이 없어요.</p>', unsafe_allow_html=True)
                     for ev in sent_reqs:
                         tag = {"pending": "대기", "accepted": "확정", "rejected": "거절됨"}.get(ev.get("status"), "")
                         if st.button(f"[{tag}] {ev.get('request_type')} · {ev.get('subject')} → {', '.join(ev.get('to') or [])} · {fmt_short(ev['date'])} {ev.get('start_time') or ''}",
-                                     key=f"sent_{ev['id']}"):
+                                     key=f"sent_{ev['id']}", wrap=False, width="stretch"):
                             st.session_state.open_event = ev["id"]
                             st.rerun()
 
@@ -2174,7 +2198,7 @@ def render_requests(ctx):
             dlg_row("메시지", ev.get("message") or "")
             if st.session_state.reject_for == ev["id"]:
                 reason = st.text_area("거절 이유 (필수)", key=f"reason_{ev['id']}", placeholder="예: 그 시간에 외부 미팅이 있어요. 금요일 오후는 어떨까요?")
-                c1, c2 = st.columns([1.4, 1])
+                c1, c2 = right_row(2)
                 if c1.button("거절 확정", key=f"btn_reject_ok_{ev['id']}", type="primary"):
                     try:
                         decide_request(ev, "rejected", me, reason)
@@ -2186,7 +2210,7 @@ def render_requests(ctx):
                     st.session_state.reject_for = None
                     st.rerun()
             else:
-                c1, c2 = st.columns([1.4, 1])
+                c1, c2 = right_row(2)
                 if c1.button("수락", key=f"btn_accept_{ev['id']}", type="primary"):
                     decide_request(ev, "accepted", me)
                     st.rerun()
