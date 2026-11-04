@@ -16,7 +16,7 @@
 #   - 모든 메일은 실제로는 MY_EMAIL(김 대리 본인) 한 곳으로만 발송되고, 제목/본문에 원래 받는 사람을 표시합니다.
 # =========================================================
 
-import os, json, html, hashlib, uuid, smtplib, threading
+import os, json, html, hashlib, uuid, smtplib, threading, base64
 import calendar as cal_lib
 from datetime import date, datetime, time, timedelta, timezone
 from email.mime.text import MIMEText
@@ -308,6 +308,17 @@ header[data-testid="stHeader"]{background:transparent;}
 .aivle-dlg-k{flex:0 0 84px;font-size:12px;color:var(--muted);padding-top:2px;}
 .aivle-dlg-v{flex:1 1 auto;min-width:0;font-size:14px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;}
 .aivle-demo-note{font-size:12px;color:var(--warn);background:var(--warn-bg);padding:6px 10px;border-radius:10px;margin:8px 0;}
+/* 11/4 시연 전 정리: 업로드·날짜 같은 크기, 버튼 폭, 음성 플레이어 */
+.aivle-hint-sm{font-size:12px;color:var(--muted);margin:6px 0 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.st-key-card_upload [data-testid="stWidgetLabel"] p{font-size:15px!important;font-weight:700!important;}
+.st-key-card_upload [data-testid="stFileUploaderDropzone"]{min-height:58px;height:58px;padding:6px 14px;box-sizing:border-box;}
+.st-key-card_upload [data-testid="stDateInput"] [data-baseweb="input"]{min-height:58px;height:58px;border:1px dashed var(--primary)!important;background:var(--tint2)!important;border-radius:16px!important;}
+.st-key-card_upload [data-testid="stDateInput"] input{height:56px;}
+[class*="st-key-chip_"],[class*="st-key-chip_"] .stButton,[class*="st-key-chip_"] button{width:100%;}
+[class*="st-key-tlink_"],[class*="st-key-tlink_"] .stButton{width:100%;}
+[class*="st-key-tlink_"] button{min-height:44px;}
+[data-testid="stSidebar"] [class*="st-key-nav_"],[data-testid="stSidebar"] [class*="st-key-nav_"] .stButton,[data-testid="stSidebar"] [class*="st-key-nav_"] button{width:100%;}
+.aivle-audio{width:100%;max-width:420px;height:40px;margin:4px 0 8px;display:block;}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -924,6 +935,7 @@ def extract_briefing(meeting_text, meeting_date):
 규칙:
 - tasks 에는 {USER_NAME}(김대리)에게 배정된 업무만 넣습니다. 다른 사람 업무는 제외합니다.
 - 상대 날짜 환산: "다음 주까지" → 다음 주 금요일, "이번 주까지" → 이번 주 금요일, "다음 달 초" → 다음 달 5일, "N일 후" → 회의 날짜 + N일. 결과가 주말이면 직전 금요일로.
+- 회의록에서 해당 업무의 마감 표현(예: "다음 주까지 받으면 좋겠습니다")을 찾으면 due_text 에 그 표현의 핵심("다음 주까지")을 그대로 적습니다. 업무 하나에 대한 마감 언급이 다른 문장에 떨어져 있어도 연결해서 찾습니다.
 - 마감이 언급되지 않은 업무는 due 를 null 로 두고, 회의 맥락(출시 시점, 다른 업무와의 선후 관계, 다음 회의 등)을 근거로 suggested_due 와 한 줄 이유를 제안합니다. 제안 날짜는 회의 날짜 이후 평일이어야 합니다.
 - summary 는 {USER_NAME} 관점에서 알아야 할 결정 사항 중심으로 씁니다."""
     response = client.responses.create(
@@ -931,18 +943,47 @@ def extract_briefing(meeting_text, meeting_date):
         input=[{"role": "system", "content": system},
                {"role": "user", "content": f"[회의록]\n{meeting_text}"}],
         text={"format": {"type": "json_schema", "name": "meeting_brief", "schema": BRIEF_SCHEMA, "strict": True}},
+        temperature=0,                                   # 같은 회의록이면 같은 결과가 나오도록
     )
     data = json.loads(response.output_text)
 
-    # 날짜 검증 + 기본값 보정
+    # 날짜는 LLM 에 맡기지 않고 파이썬 규칙으로 다시 계산 (요일 착오 방지)
+    def to_weekday(d):                       # 주말이면 직전 금요일
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        return d
+
+    def add_bdays(d, n):                     # 영업일 n 일 뒤
+        while n > 0:
+            d += timedelta(days=1)
+            if d.weekday() < 5:
+                n -= 1
+        return d
+
+    def resolve_due(text, llm_due):
+        text = text or ""
+        monday_next = meeting_date + timedelta(days=7 - meeting_date.weekday())
+        if "다음 주" in text or "다음주" in text:
+            return monday_next + timedelta(days=4), "다음 주 금요일"
+        if "이번 주" in text or "이번주" in text:
+            return meeting_date + timedelta(days=4 - meeting_date.weekday()), "이번 주 금요일"
+        if "다음 달" in text or "다음달" in text:
+            first = (meeting_date.replace(day=1) + timedelta(days=32)).replace(day=1)
+            return to_weekday(first + timedelta(days=4)), "다음 달 초"
+        if llm_due and monday_next <= llm_due <= monday_next + timedelta(days=6):
+            return monday_next + timedelta(days=4), text or "다음 주 금요일"   # 다음 주 마감은 금요일로 통일
+        return (to_weekday(llm_due), text) if llm_due else (None, text)
+
     tasks = []
+    undated_n = 0
     for i, t in enumerate(data.get("tasks", [])):
-        due = parse_iso(t.get("due"))
-        suggested = parse_iso(t.get("suggested_due")) if due is None else None
-        reason = (t.get("suggest_reason") or "").strip() if due is None else None
-        if due is None and suggested is None:
-            suggested = meeting_date + timedelta(days=7)
-            reason = "회의 후 1주 (기본 제안)"
+        due, due_text = resolve_due(t.get("due_text"), parse_iso(t.get("due")))
+        suggested, reason = None, None
+        if due is None:
+            suggested = add_bdays(meeting_date, 5 + undated_n)     # 다음 주 같은 요일부터 하루씩
+            undated_n += 1
+            reason = "회의에서 마감이 정해지지 않아 회의 후 약 1주(영업일 기준)로 제안해요"
+        t["due_text"] = due_text
         tasks.append({
             "id": f"t{i + 1}",
             "title": (t.get("title") or "").strip() or f"업무 {i + 1}",
@@ -996,8 +1037,12 @@ def load_meeting(text, name, meeting_date, key):
 # ---- (b) 업무 초안 작성 ----
 def generate_draft(task):
     """회의 맥락 + 업무 → 바로 다듬어 쓸 수 있는 초안 (LLM)"""
-    system = (f"당신은 {USER_NAME}의 비서 '{APP_NAME}'입니다. 회의록의 결정 사항을 근거로 {USER_NAME}가 바로 다듬어 쓸 수 있는 업무 초안을 한국어로 작성합니다. "
-              "마크다운 기호 없이, 제목 한 줄 뒤에 번호 목록과 짧은 문단으로 구성합니다. 회의록에 없는 사실은 만들지 않고 '확인 필요'라고 표시합니다. 500자 안팎.")
+    system = (f"당신은 {USER_NAME}의 비서 '{APP_NAME}'입니다. 업무를 설명하지 말고, 그 업무의 결과물 자체의 초안을 한국어로 작성합니다. "
+              "예: 'SNS 콘텐츠 초안'이면 실제 게시물 문구 3안(기능 강조형, 후기형, 숏폼 영상 대본), "
+              "'경쟁사 분석 보고서'면 보고서 목차와 각 항목에 채울 내용·조사 방법, "
+              "'인플루언서 후보 조사'면 선정 기준표와 후보 조사 양식(플랫폼, 팔로워 규모, 협업 형태, 예상 비용 칸). "
+              "회의록의 결정 사항(출시 시점, 채널, 예산, 콘텐츠 방향)을 반영하고, 회의록에 없는 회사·채널·수치·실명은 절대 지어내지 말고(예: 회의록에 A사만 나오면 B사, C사를 만들지 않음) 빈칸은 [확인 필요]로 둡니다. "
+              "마크다운 기호(#, *, **) 없이 제목 한 줄, 번호 목록, 짧은 문단으로 600자 안팎.")
     user = (f"[업무] {task['title']}\n세부: {task['detail']}\n요청: {task['requester']}\n마감: {task.get('due') or task.get('suggested_due')}\n\n"
             f"[회의록]\n{st.session_state.meeting_text or '(회의록 없음)'}")
     response = client.responses.create(model=LLM_MODEL, input=[{"role": "system", "content": system}, {"role": "user", "content": user}])
@@ -1085,14 +1130,17 @@ def build_system_prompt():
         f"당신은 '{APP_NAME}'입니다. 마케팅팀 {USER_NAME}의 개인 비서로, {USER_NAME}가 놓친 회의 내용을 정리하고 업무·일정·메일을 대신 처리합니다. "
         f"사용자가 음성으로 '에이블'이라고 부르면 그것은 {APP_NAME}의 한국어 발음이며 당신을 부르는 말입니다. 스스로를 소개할 때는 {APP_NAME}이라고 합니다.",
         "말투: 간결한 한국어 존댓말. 답변은 2~4문장. 음성으로 읽히므로 마크다운, 이모지, 특수기호 없이 자연스러운 문장으로 말합니다. 여러 항목은 '첫째, 둘째'처럼 이어 말합니다.",
-        f"오늘: {today.isoformat()} ({WEEKDAY_KO[today.weekday()]}요일). '이번 주'는 오늘이 속한 월요일부터 일요일, '다음 주'는 그 다음 주입니다.",
+        f"오늘: {today.isoformat()} ({WEEKDAY_KO[today.weekday()]}요일). "
+        f"이번 주 = {(today - timedelta(days=today.weekday())).isoformat()} ~ {(today + timedelta(days=6 - today.weekday())).isoformat()}, "
+        f"다음 주 = {(today + timedelta(days=7 - today.weekday())).isoformat()} ~ {(today + timedelta(days=13 - today.weekday())).isoformat()}. "
+        "날짜를 말할 때는 이 범위로 이번 주/다음 주를 판단하고, list_events 결과의 weekday 값을 그대로 씁니다. 일정을 물으면 범위를 이번 주와 다음 주까지 넉넉히 조회합니다.",
         "회의록이 있으면 반드시 회의록 내용에 근거해 답하고, 회의록에 없는 내용은 추측하지 말고 없다고 말합니다. 회의록이 없으면 화면 위의 '회의록 파일 올리기'에서 파일을 올리거나 샘플 회의록을 써 보라고 한 문장으로 안내합니다.",
         f"팀 주소록: {address_book_text()}. '팀장님께 보내줘'처럼 이름으로 말하면 그 사람을 to 로 씁니다.",
         "도구 사용 규칙:",
         "- send_email: 사용자가 '메일로 보내줘', '이메일로 정리해줘'처럼 명시적으로 요청할 때만 호출합니다. 요약만 원하면 호출하지 않습니다. 수신자를 말하지 않으면 to 에 '김 대리' 를 넣습니다.",
         "- add_calendar_event: 업무나 마감을 캘린더에 넣어 달라고 할 때 호출합니다. 업무마다 한 번씩 호출하고, due 가 없는 업무는 suggested_due 를 쓰며 그 사실을 답변에서 알립니다. event_id 가 이미 있는 업무는 다시 등록하지 않습니다.",
         "- list_events: 일정을 물으면 먼저 호출하고, 그 결과에 있는 일정만 말합니다. 협업·미팅 요청은 status(pending 대기 / accepted 확정 / rejected 거절)를 함께 말합니다.",
-        "- 도구 결과가 pending_confirmation 이면 '내용을 준비했으니 화면에 뜬 확인 창에서 추가(또는 보내기) 버튼을 눌러 주세요'라고 짧게 안내합니다. 실제로 보냈다거나 등록했다고 말하지 마세요.",
+        "- 도구 결과가 pending_confirmation 이면 메일은 '메일 초안을 준비했어요. 확인 창에서 보내기를 눌러 주세요', 캘린더는 '일정을 준비했어요. 확인 창에서 추가를 눌러 주세요'처럼 짧게 안내합니다. 실제로 보냈다거나 등록했다고 말하지 마세요.",
         "",
         f"[회의 정보] 회의 날짜: {st.session_state.meeting_date} / 파일: {st.session_state.meeting_name or '없음'}",
         f"[{USER_NAME}의 업무 목록 JSON]\n{json.dumps(tasks_brief, ensure_ascii=False)}",
@@ -1221,7 +1269,7 @@ def do_calendar(action, title, date_iso, description):
     if task and task.get("event_id") and store_get(STORE, task["event_id"]):
         remove_pending(action["id"])
         update_tool_status(action, "skipped")
-        return "skip", f"'{task['title']}' 은(는) 이미 캘린더에 있어요."
+        return "skip", f"'{task['title']}' 일정은 이미 캘린더에 있어요."
 
     # 중복 방지 2: 같은 제목 + 같은 날짜 일정이 이미 있음
     existing = find_existing_event(title, date_iso, store_list(STORE, date_iso, date_iso))
@@ -1231,7 +1279,7 @@ def do_calendar(action, title, date_iso, description):
     else:
         event_id = store_add(STORE, title=title, date=date_iso, description=description or "", source="able",
                              task_id=task["id"] if task else None)
-        text = f"{fmt_long_kor(date_iso)}에 '{title}' 을(를) 캘린더에 추가했어요."
+        text = f"{fmt_long_kor(date_iso)}에 '{title}' 일정을 캘린더에 추가했어요."
 
     if task:
         task["due"] = date_iso
@@ -1734,9 +1782,7 @@ def render_sidebar(ctx):
         st.markdown('<div style="height:16px"></div><div class="aivle-conn">'
                     f'<span>{dot(bool(client))}OpenAI {"연결됨" if client else "설정 필요"}</span>'
                     f'<span>{dot(GMAIL_OK)}Gmail {"연결됨" if GMAIL_OK else "설정 필요"}</span>'
-                    f'<span style="color:var(--muted)">메일은 모두 {esc(MY_EMAIL)} 로 발송 (데모)</span>'
-                    f'<span style="color:var(--muted)">캘린더: 앱 안 저장소 (재시작 시 초기화)</span>'
-                    f'<span style="color:var(--muted)">{fmt_header_date(today)}</span></div>', unsafe_allow_html=True)
+                    f'<span style="color:var(--muted)">메일은 모두 {esc(MY_EMAIL)} 로 발송 (데모)</span></div>', unsafe_allow_html=True)
 
         missing = missing_secrets(OPENAI_API_KEY, GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
         if missing:
@@ -1792,11 +1838,10 @@ def render_meeting_strip(ctx):
 
     with st.container(key="card_upload"):
         st.markdown('<p class="aivle-eyebrow">① 먼저 회의록을 올려 주세요</p>', unsafe_allow_html=True)
-        u1, u2 = st.columns([2.2, 1], vertical_alignment="top")
+        u1, u2 = st.columns(2, vertical_alignment="top")
         uploaded = u1.file_uploader("회의록 파일(.txt) 올리기", type=["txt"], key="uploader")
-        meeting_date_input = u2.date_input("회의 날짜", value=parse_iso(st.session_state.meeting_date) or today, format="YYYY-MM-DD",
-                                           help="회의가 열린 날짜예요. 마감 계산의 기준이 됩니다.")
-        u2.markdown('<p class="aivle-hint">\'다음 주까지\' 같은 마감을 이 날짜 기준으로 계산해요</p>', unsafe_allow_html=True)
+        meeting_date_input = u2.date_input("회의 날짜", value=parse_iso(st.session_state.meeting_date) or today, format="YYYY-MM-DD")
+        u2.markdown('<p class="aivle-hint-sm">\'다음 주까지\' 같은 마감은 이 날짜 기준으로 계산해요</p>', unsafe_allow_html=True)
         s1, s2, _ = st.columns([1.6, 0.8, 2.6])
         if s1.button("샘플 회의록으로 해보기", key="btn_sample"):
             key = ("sample", hashlib.md5(SAMPLE_MEETING.encode("utf-8")).hexdigest(), meeting_date_input.isoformat())
@@ -1845,12 +1890,16 @@ def render_assistant(ctx):
                             f'안녕하세요, {APP_NAME}이에요. 위에서 회의록을 올리면 요약하고 {USER_NAME}님 업무를 정리해 드릴게요. '
                             '아래 마이크나 입력창으로 부탁해 주세요.</div></div>', unsafe_allow_html=True)
             newest_id = msgs[-1]["id"] if msgs and msgs[-1]["role"] == "assistant" else None
+            last_task_msg = next((m["id"] for m in reversed(msgs) if m["role"] == "assistant" and m.get("show_tasks")), None)
             for m in msgs:
                 render_message(m)
-                if m["role"] == "assistant" and m.get("show_tasks") and st.session_state.tasks:
+                if m["id"] == last_task_msg and st.session_state.tasks:          # 업무 카드는 가장 최근 답변 아래에만
                     render_task_links(m["id"])
                 if m["id"] == newest_id and st.session_state.tts_audio:          # 최신 답변에만 플레이어 (한 번만 자동 재생)
-                    st.audio(st.session_state.tts_audio, format="audio/mp3", autoplay=st.session_state.tts_autoplay)
+                    # st.audio 대신 HTML 플레이어 (배포 환경에서 Audio 모듈 로딩 오류 회피)
+                    b64 = base64.b64encode(st.session_state.tts_audio).decode("ascii")
+                    auto = " autoplay" if st.session_state.tts_autoplay else ""
+                    st.markdown(f'<audio class="aivle-audio" controls{auto} src="data:audio/mp3;base64,{b64}"></audio>', unsafe_allow_html=True)
                     st.session_state.tts_autoplay = False
         if not has_meeting and st.session_state.messages:
             st.markdown('<p class="aivle-hint">회의 내용은 회의록이 있어야 답할 수 있어요 — 위 카드에서 파일을 올리거나 \'샘플 회의록으로 해보기\'를 눌러 주세요.</p>',
@@ -1874,7 +1923,7 @@ def render_assistant(ctx):
         with st.form("msg_form", clear_on_submit=True, border=False):
             f1, f2 = st.columns([5, 1], vertical_alignment="bottom")
             typed = f1.text_input("글로 부탁하기", placeholder=f"{APP_NAME}에게 글로 부탁하기 (예: 팀장님께 업무 정리 메일 보내줘)", label_visibility="collapsed")
-            sent = f2.form_submit_button("보내기")
+            sent = f2.form_submit_button("전송")
         if sent and typed.strip():
             incoming, incoming_via = typed, "text"
 
@@ -1981,7 +2030,7 @@ def render_tasks(ctx):
                             st.rerun()
                     else:
                         st.markdown(f'<span class="aivle-done">{"✓ 완료" if status == "done" else "✓ 캘린더에 추가됨"}</span>', unsafe_allow_html=True)
-                        if st.button("캘린더에서 보기 →", key=f"btn_seecal_{t['id']}"):
+                        if t.get("event_id") and st.button("캘린더에서 보기 →", key=f"btn_seecal_{t['id']}"):
                             d = parse_iso(t["due"]) or today
                             go("calendar", cal_year=d.year, cal_month=d.month)
                     if status != "done":
