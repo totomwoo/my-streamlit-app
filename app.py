@@ -2070,7 +2070,7 @@ def render_assistant(ctx):
         history_box = st.container(height=400, border=False, autoscroll=True)
         with history_box:
             msgs = st.session_state.messages
-            if not msgs:
+            if True:                                                # 첫 인사는 대화가 쌓여도 맨 위에 항상 보임
                 st.markdown(f'<div class="aivle-msg-a"><span class="aivle-msg-label">{APP_NAME}</span><div class="aivle-bubble-a">'
                             f'안녕하세요, {APP_NAME}이에요. 위에서 회의록을 올리면 요약하고 {USER_NAME}님 업무를 정리해 드릴게요. '
                             '아래 마이크나 입력창으로 명령해 주세요.</div></div>', unsafe_allow_html=True)
