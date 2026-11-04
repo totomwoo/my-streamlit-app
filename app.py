@@ -1,37 +1,38 @@
 # =========================================================
-# 에이블(able.) — 김 대리의 음성 AI 개인비서
+# AIVLE — 김 대리의 음성 AI 개인비서 (음성으로는 '에이블'이라고 부릅니다)
 # KT AIVLE School 미니프로젝트 3차
 #
 # 구성
-#   1) 설정   : 라이브러리, 상수, Secrets, 외부 서비스 클라이언트, CSS
-#   2) 상태   : session_state 초기화
-#   3) 도구 함수 : 날짜/이메일/캘린더/월간 그리드 등 순수 함수
-#   4) LLM    : 회의록 분석(구조화 출력), 대화(함수 호출 루프), STT, TTS
-#   5) 화면   : 헤더 / 왼쪽(브리핑·업무·캘린더) / 오른쪽(대화 패널)
+#   1) 설정   : 라이브러리, 상수, Secrets, OpenAI, 팀 주소록(데모), CSS
+#   2) 공용 저장소 : 앱 안 캘린더(일정·요청)를 모든 접속자가 함께 보는 메모리 저장소 (st.cache_resource)
+#   3) 상태   : session_state 초기화
+#   4) 도구 함수 : 날짜/이메일(데모 발송)/업무/요청 등 순수 함수
+#   5) LLM    : 회의록 분석(구조화 출력), 대화(함수 호출 루프), 초안 작성, STT, TTS
+#   6) 다이얼로그 : 캘린더 추가 / 메일 발송 / 일정 보기 / 협업·미팅 요청 / 업무 초안
+#   7) 화면   : 사이드바(보기 모드 + 메뉴) + 페이지별 render 함수 + main()
+#
+# 데모 전제
+#   - 캘린더는 앱 안 저장소만 사용 (구글 캘린더 연동 없음). 앱이 재시작/재배포되면 초기화됩니다.
+#   - 모든 메일은 실제로는 MY_EMAIL(김 대리 본인) 한 곳으로만 발송되고, 제목/본문에 원래 받는 사람을 표시합니다.
 # =========================================================
 
-import os, json, html, hashlib, uuid, smtplib
+import os, json, html, hashlib, uuid, smtplib, threading
 import calendar as cal_lib
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from email.mime.text import MIMEText
+from urllib.parse import quote
 
 import streamlit as st
 from openai import OpenAI
-
-# 구글 캘린더 라이브러리 (없어도 앱은 동작해야 함)
-try:
-    from google.oauth2 import service_account
-    from googleapiclient.discovery import build
-    GCAL_LIB_OK = True
-except Exception:
-    GCAL_LIB_OK = False
 
 
 # =========================================================
 # 1) 설정
 # =========================================================
-st.set_page_config(page_title="able. — 김 대리의 AI 비서", page_icon="◼", layout="wide")
+st.set_page_config(page_title="AIVLE — 김 대리의 AI 비서", page_icon="◆", layout="wide", initial_sidebar_state="expanded")
 
+APP_NAME = "AIVLE"
+USER_NAME = "김 대리"
 KST = timezone(timedelta(hours=9))          # 한국 시간 (서머타임 없음)
 LLM_MODEL = "gpt-4o-mini"
 STT_MODEL = "whisper-1"
@@ -40,8 +41,127 @@ TTS_VOICE = "alloy"
 MAX_TURNS = 10                              # 대화 기록 유지 턴 수
 WEEKDAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
 WEEKDAY_EN = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
-CAL_SCOPES = ["https://www.googleapis.com/auth/calendar"]
-USER_NAME = "김 대리"
+STEP_LABELS = ["회의록 올리기", "업무 확인 · 일정 등록", f"{APP_NAME}에게 부탁하기"]
+PAGES = {"assistant": f"{APP_NAME}에게 부탁하기", "tasks": "내 업무", "calendar": "캘린더", "requests": "받은 요청"}
+DEFAULT_MY_EMAIL = "totomwoo@gmail.com"     # MY_EMAIL Secrets 가 없을 때 쓰는 기본 수신자 (사용자 승인)
+REQUEST_TYPES = ["미팅 요청", "협업 요청"]
+DURATIONS = [30, 60, 90]
+
+# 팀 주소록 (데모용 가짜 주소). 김 대리는 MY_EMAIL. 실제 발송은 모두 MY_EMAIL 로만 간다.
+DEMO_CONTACTS = [
+    ("팀장", "teamlead@aivle-demo.kr"),
+    ("박과장", "park@aivle-demo.kr"),
+    ("이과장", "lee@aivle-demo.kr"),
+    ("최대리", "choi@aivle-demo.kr"),
+]
+
+# 도구 실행 결과를 화면에 보여줄 때 쓰는 한국어 문구 ({n} = 건수)
+TOOL_LABELS = {
+    ("list_events", "done"): "일정 조회함",
+    ("add_calendar_event", "waiting"): "캘린더 추가 — 확인 대기",
+    ("add_calendar_event", "done"): "캘린더에 {n}건 추가함",
+    ("add_calendar_event", "cancelled"): "캘린더 추가 취소함",
+    ("add_calendar_event", "skipped"): "이미 캘린더에 있는 업무",
+    ("send_email", "waiting"): "메일 발송 — 확인 대기",
+    ("send_email", "done"): "메일 보냄",
+    ("send_email", "cancelled"): "메일 발송 취소함",
+    ("request", "sent"): "협업·미팅 요청 {n}명에게 보냄",
+}
+
+# 파일 없이도 시연할 수 있는 샘플 회의록 (교안 meeting.txt)
+SAMPLE_MEETING_NAME = "meeting.txt (샘플)"
+SAMPLE_MEETING = """팀장: 오늘 미팅을 시작하겠습니다. 오늘 주제는 신제품 출시 마케팅 전략입니다.
+박과장: 김대리가 외출 중이라 오늘 회의에는 참석하지 못했습니다.
+최대리: 제가 나중에 김대리에게 미팅 기록을 전달하겠습니다.
+팀장: 네, 그렇게 해주세요. 김대리도 내용은 꼭 알아야 합니다.
+이과장: 이번 신제품은 다음 달 초 출시 예정이라 마케팅 준비를 서둘러야 합니다.
+팀장: 맞습니다. 우선 전체적인 마케팅 방향부터 정해보죠.
+박과장: 저는 온라인 중심으로 마케팅을 진행하는 것이 좋다고 생각합니다.
+이과장: 요즘은 SNS 광고가 가장 효과적이니까요.
+최대리: 특히 인스타그램과 유튜브가 좋을 것 같습니다.
+팀장: 네, SNS 마케팅은 기본으로 가져가야겠네요.
+박과장: 그리고 경쟁사 사례를 분석해 보면 좋겠습니다.
+팀장: 좋은 의견입니다. 경쟁사들이 어떤 마케팅을 하는지 파악해야 합니다.
+이과장: 최근 경쟁사 A사가 SNS 캠페인을 크게 진행했습니다.
+최대리: 맞습니다. 인플루언서를 활용한 캠페인이었습니다.
+팀장: 그렇다면 우리도 경쟁사 마케팅을 분석할 필요가 있겠네요.
+박과장: 김대리가 데이터 분석을 잘하니까 그 업무를 맡기면 어떨까요?
+팀장: 좋습니다. 김대리에게 경쟁사 온라인 마케팅 사례 분석을 맡기죠.
+최대리: 네, 제가 김대리에게 경쟁사 마케팅 분석 업무가 할당됐다고 전달하겠습니다.
+이과장: 분석 보고서를 작성해서 공유하면 좋겠습니다.
+팀장: 네, 김대리가 경쟁사 SNS 광고와 프로모션 사례를 정리하면 좋겠습니다.
+박과장: 보고서는 다음 주까지 받으면 좋겠습니다.
+팀장: 좋습니다. 다음 안건으로 넘어가겠습니다.
+이과장: 신제품 홍보 채널을 정해야 할 것 같습니다.
+박과장: 인스타그램 광고는 꼭 진행해야 합니다.
+최대리: 유튜브 리뷰 콘텐츠도 필요할 것 같습니다.
+팀장: 유튜브 인플루언서 협업도 고려해보죠.
+이과장: 요즘은 틱톡도 영향력이 커졌습니다.
+박과장: 맞습니다. 젊은 층을 타겟으로 할 때 효과적입니다.
+팀장: SNS 콘텐츠 기획도 필요합니다.
+최대리: 콘텐츠 아이디어를 정리해야 할 것 같습니다.
+박과장: 콘텐츠 초안은 누가 작성하면 좋을까요?
+팀장: 김대리가 콘텐츠 기획도 잘하니까 SNS 홍보 콘텐츠 초안을 맡기면 어떨까요?
+이과장: 좋은 생각입니다.
+최대리: 그럼 김대리에게 SNS 홍보 콘텐츠 초안 작성도 부탁하는 걸로 하겠습니다.
+팀장: 네, 김대리에게 두 가지 업무가 있겠네요.
+박과장: 경쟁사 마케팅 분석과 SNS 콘텐츠 초안 작성이군요.
+팀장: 맞습니다.
+이과장: 콘텐츠 방향도 미리 정해두면 좋겠습니다.
+팀장: 어떤 방향이 좋을까요?
+박과장: 제품 기능을 강조하는 콘텐츠가 좋겠습니다.
+최대리: 사용 후기 형식의 콘텐츠도 좋을 것 같습니다.
+이과장: 짧은 영상 콘텐츠도 필요할 것 같습니다.
+팀장: 네, 요즘은 숏폼 콘텐츠가 중요합니다.
+박과장: SNS 광고 예산도 논의해야 합니다.
+팀장: 이번 프로젝트 예산은 어느 정도인가요?
+이과장: 전체 마케팅 예산은 약 5천만 원입니다.
+팀장: SNS 광고에 절반 정도 사용할 수 있겠네요.
+박과장: 인플루언서 협업 비용도 고려해야 합니다.
+최대리: 중급 인플루언서 3명 정도 협업하면 좋겠습니다.
+팀장: 후보 인플루언서를 조사해야 합니다.
+박과장: 그 작업도 김대리가 하면 어떨까요?
+이과장: 네, 김대리가 SNS 데이터 조사도 잘합니다.
+팀장: 좋습니다. 김대리에게 인플루언서 후보 리스트 조사도 부탁합시다.
+최대리: 제가 김대리에게 업무 내용을 정리해서 전달하겠습니다.
+팀장: 감사합니다.
+박과장: 그러면 김대리 업무가 세 가지네요.
+이과장: 경쟁사 마케팅 분석, SNS 콘텐츠 초안 작성, 인플루언서 후보 조사입니다.
+팀장: 맞습니다. 회의록에도 그렇게 정리해주세요.
+최대리: 네, 김대리에게 전달할 때도 명확히 설명하겠습니다.
+팀장: 다음으로 광고 일정에 대해 이야기해보죠.
+박과장: 출시 2주 전부터 광고를 시작하면 좋겠습니다.
+이과장: 티저 콘텐츠를 먼저 올리는 것도 좋겠습니다.
+최대리: 티저 영상은 제작이 필요합니다.
+팀장: 영상 제작 업체도 알아봐야겠네요.
+박과장: 디자인팀과 협의하면 될 것 같습니다.
+이과장: 랜딩 페이지도 준비해야 합니다.
+팀장: 맞습니다. 구매 페이지도 필요합니다.
+최대리: SNS에서 랜딩 페이지로 유도하면 좋겠습니다.
+박과장: 할인 이벤트도 고려해야 합니다.
+팀장: 초기 프로모션은 어떤 것이 좋을까요?
+이과장: 출시 기념 할인 이벤트가 좋겠습니다.
+최대리: SNS 공유 이벤트도 효과적입니다.
+팀장: 좋습니다. 이벤트 기획도 진행해봅시다.
+박과장: 이벤트 경품은 제품으로 하면 될 것 같습니다.
+이과장: 참여 조건은 SNS 팔로우와 공유로 하면 좋겠습니다.
+팀장: 전체 일정은 다음 주에 다시 점검합시다.
+박과장: 네, 다음 회의에서 진행 상황을 공유하겠습니다.
+최대리: 김대리에게는 오늘 논의된 업무를 바로 전달하겠습니다.
+팀장: 꼭 전달해주세요.
+이과장: 특히 경쟁사 마케팅 분석 보고서는 중요합니다.
+박과장: SNS 콘텐츠 초안도 빨리 받아야 합니다.
+팀장: 인플루언서 후보 리스트도 같이 부탁한다고 전해주세요.
+최대리: 네, 김대리에게 세 가지 업무를 명확히 전달하겠습니다.
+팀장: 좋습니다.
+박과장: 오늘 회의 내용은 회의록으로 정리하겠습니다.
+이과장: 김대리도 회의록을 보면 이해할 수 있을 겁니다.
+최대리: 제가 회의록 파일을 김대리에게 보내겠습니다.
+팀장: 모두 수고하셨습니다.
+박과장: 감사합니다.
+이과장: 수고하셨습니다.
+최대리: 회의 종료하겠습니다.
+"""
 
 
 def get_secret(name, default=None):
@@ -55,27 +175,17 @@ def get_secret(name, default=None):
         return default
 
 
-def get_service_account_info():
-    """st.secrets 의 [gcp_service_account] 표를 dict 로. 없으면 None"""
-    try:
-        info = dict(st.secrets["gcp_service_account"])
-        if info.get("private_key"):
-            info["private_key"] = info["private_key"].replace("\\n", "\n")
-        return info if info.get("client_email") else None
-    except Exception:
-        return None
-
-
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
-GMAIL_ADDRESS = get_secret("GMAIL_ADDRESS")
+GMAIL_ADDRESS = get_secret("GMAIL_ADDRESS")          # 발신 계정 (기본값 없음)
 GMAIL_APP_PASSWORD = get_secret("GMAIL_APP_PASSWORD")
-MY_EMAIL = get_secret("MY_EMAIL") or GMAIL_ADDRESS or ""   # 기본 수신자
-GOOGLE_CALENDAR_ID = get_secret("GOOGLE_CALENDAR_ID")
-SA_INFO = get_service_account_info()
+MY_EMAIL = get_secret("MY_EMAIL") or DEFAULT_MY_EMAIL  # 모든 메일이 실제로 도착하는 곳
+APP_URL = (get_secret("APP_URL") or "").rstrip("/")   # 요청 메일에 넣을 앱 주소 (없으면 링크 생략)
 GMAIL_OK = bool(GMAIL_ADDRESS and GMAIL_APP_PASSWORD)
+CONTACTS = [(USER_NAME, MY_EMAIL)] + DEMO_CONTACTS
+CONTACT_EMAIL = dict(CONTACTS)
+TEAMMATES = [name for name, _ in DEMO_CONTACTS]
 
 
-# ---- OpenAI 클라이언트 ----
 @st.cache_resource(show_spinner=False)
 def get_openai_client(api_key):
     return OpenAI(api_key=api_key)
@@ -84,141 +194,130 @@ def get_openai_client(api_key):
 client = get_openai_client(OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
-# ---- 구글 캘린더 서비스 (서비스 계정) ----
-@st.cache_resource(show_spinner=False)
-def get_calendar_service(sa_json):
-    creds = service_account.Credentials.from_service_account_info(json.loads(sa_json), scopes=CAL_SCOPES)
-    return build("calendar", "v3", credentials=creds, cache_discovery=False)
-
-
-calendar_service, CAL_SETUP_ERROR = None, None
-if not GCAL_LIB_OK:
-    CAL_SETUP_ERROR = "google-api-python-client 가 설치되지 않았습니다."
-elif not (SA_INFO and GOOGLE_CALENDAR_ID):
-    CAL_SETUP_ERROR = "Secrets 에 gcp_service_account 또는 GOOGLE_CALENDAR_ID 가 없습니다."
-else:
-    try:
-        calendar_service = get_calendar_service(json.dumps(SA_INFO, sort_keys=True))
-    except Exception as e:
-        CAL_SETUP_ERROR = f"캘린더 인증 실패: {e}"
-CAL_OK = calendar_service is not None
-
-
-# ---- 디자인 토큰 / CSS (에디토리얼 모노) ----
+# ---- 디자인 토큰 / CSS (보라 팔레트) ----
+# 원칙: 스타일만 바꾼다. Streamlit 구성요소를 숨기지 않고, Material 아이콘(span[data-testid="stIconMaterial"]) 에는 글꼴을 적용하지 않는다.
 CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=IBM+Plex+Sans+KR:wght@300;400;500;600&display=swap');
-:root{--paper:#ECEBE7;--ink:#1C1C1C;--gray:#5F5E5A;--rule:#C9C7C1;--charcoal:#4B4B4D;--stripe:#3E3E40;--card:#5A5A5C;--on-dark:#F1F0EC;--on-dark-muted:#CFCDC7;}
-.stApp{background:var(--paper);color:var(--ink);}
-.stApp p,.stApp div,.stApp span,.stApp label,.stApp input,.stApp textarea,.stApp button{font-family:'IBM Plex Sans KR',sans-serif;}
-.stApp .able-no,.stApp .able-due,.stApp .able-daynum,.stApp .able-month,.stApp .able-mark-sm,.stApp .able-wordmark{font-family:'Inter',sans-serif;}
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@600;700&family=Noto+Sans+KR:wght@400;500;700&display=swap');
+:root{--primary:#5B4BE0;--primary-dark:#4F3FD0;--primary-text:#4338CA;--tint:#EDE9FE;--tint2:#F4F3FF;--border:#DDD6FE;--sidebar-border:#E0DDFB;
+--text:#1E1B4B;--muted:#5B5F7A;--text2:#3F3F5F;--dark:#1E1B4B;
+--task:#1D4ED8;--task-tint:#DBEAFE;--task-border:#BFDBFE;--task-row:#F5F8FF;
+--cal:#047857;--cal-tint:#D1FAE5;--cal-bg:#F0FDF4;--cal-text:#065F46;
+--warn:#92400E;--warn-bg:#FEF3C7;--ok:#10B981;--shadow:0 10px 30px rgba(91,75,224,.10);}
+.stApp{background:linear-gradient(160deg,#EFEBFF 0%,#E7EEFF 55%,#E3F3FF 100%);color:var(--text);font-family:'Noto Sans KR',sans-serif;}
+div.stApp :where(*:not([data-testid="stIconMaterial"]):not([data-testid="stIconEmoji"]):not([class*="material"]):not([translate="no"]):not(code):not(pre):not(kbd):not(svg):not(svg *)),
+[data-testid="stDialog"] :where(*:not([data-testid="stIconMaterial"]):not([data-testid="stIconEmoji"]):not([class*="material"]):not([translate="no"]):not(code):not(pre):not(kbd):not(svg):not(svg *)){font-family:'Noto Sans KR',sans-serif;}
+.stApp .aivle-wordmark{font-family:'Poppins',sans-serif;}
 header[data-testid="stHeader"]{background:transparent;}
-.block-container{padding:40px 64px 64px;max-width:1440px;}
-/* 버튼: 각진 모서리, 얇은 선 */
-.stButton>button,.stFormSubmitButton>button{border-radius:0;border:1px solid var(--ink);background:transparent;color:var(--ink);font-size:12px;min-height:40px;padding:0 14px;box-shadow:none;}
-.stButton>button:hover,.stFormSubmitButton>button:hover{background:var(--ink);color:var(--paper);border-color:var(--ink);}
-.stButton>button[kind="primary"]{background:var(--ink);color:var(--paper);}
-[data-baseweb="input"],[data-baseweb="textarea"],[data-baseweb="base-input"],[data-testid="stFileUploaderDropzone"]{border-radius:0!important;}
-/* 타이포 */
-.able-wordmark{font-family:'Inter',sans-serif;font-weight:500;font-size:96px;line-height:.9;letter-spacing:-.05em;margin:0;}
-.able-meta{font-size:12px;line-height:1.6;color:var(--gray);text-align:right;}
-.able-tagline{margin-top:24px;padding-bottom:16px;border-bottom:1px solid var(--rule);display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:14px;color:#3F3E3B;}
-.able-section{font-size:12px;color:var(--gray);margin:28px 0 10px;letter-spacing:.02em;}
-.able-lead{font-size:24px;line-height:1.5;font-weight:300;letter-spacing:-.01em;margin:0 0 10px;}
-.able-sub{font-size:13px;line-height:1.7;color:var(--gray);margin:0 0 4px;}
-.able-hint{font-size:13px;line-height:1.7;color:var(--gray);margin:4px 0 0;}
-.able-no{font-family:'Inter',sans-serif;font-size:13px;color:var(--gray);}
-.able-task-title{display:block;font-size:16px;font-weight:500;}
-.able-task-detail{display:block;font-size:12px;color:var(--gray);margin-top:2px;}
-.able-due{font-family:'Inter',sans-serif;font-size:13px;}
-.able-muted{color:var(--gray);}
-.able-rule{border-bottom:1px solid var(--rule);margin:4px 0 8px;}
-.able-rule-dark{border-bottom:1px solid var(--ink);margin:0 0 4px;}
-.able-registered{display:inline-flex;align-items:center;gap:8px;font-size:12px;}
-.able-registered i{display:inline-block;width:8px;height:8px;background:var(--ink);}
-/* 캘린더 */
-.able-month{font-family:'Inter',sans-serif;font-size:20px;font-weight:500;letter-spacing:-.02em;line-height:40px;}
-.able-legend{font-size:12px;color:#3F3E3B;display:flex;gap:16px;justify-content:flex-end;line-height:40px;}
-.able-legend i{display:inline-block;width:10px;height:10px;margin-right:6px;vertical-align:-1px;}
-.able-grid{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));border-top:1px solid var(--ink);border-left:1px solid var(--rule);}
-.able-grid-head{padding:8px;font-size:11px;color:var(--gray);border-right:1px solid var(--rule);border-bottom:1px solid var(--rule);}
-.able-cell{min-height:76px;padding:8px;border-right:1px solid var(--rule);border-bottom:1px solid var(--rule);display:flex;flex-direction:column;gap:5px;min-width:0;}
-.able-cell-today{background:#E2E1DC;}
-.able-daynum{font-family:'Inter',sans-serif;font-size:13px;color:var(--gray);}
-.able-cell-today .able-daynum{color:var(--ink);font-weight:500;}
-.able-chip{font-size:11px;padding:2px 6px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.able-chip-fill{background:var(--ink);color:var(--paper);}
-.able-chip-line{border:1px solid var(--ink);color:var(--ink);}
-.able-more{font-size:11px;color:var(--gray);}
-/* 오른쪽 차콜 패널 */
-.st-key-able_strip{background:repeating-linear-gradient(90deg,var(--stripe) 0 2px,var(--charcoal) 2px 5px);padding:18px 24px;box-shadow:0 18px 40px rgba(0,0,0,.18);}
-.st-key-able_strip p,.st-key-able_strip span,.st-key-able_strip div{color:var(--on-dark);}
-.st-key-able_chat{background:var(--charcoal);padding:24px;box-shadow:0 24px 48px rgba(0,0,0,.22);}
-.st-key-able_chat p,.st-key-able_chat span,.st-key-able_chat label,.st-key-able_chat [data-testid="stMarkdownContainer"]{color:var(--on-dark);}
-.st-key-able_chat .stButton>button,.st-key-able_chat .stFormSubmitButton>button{border-color:var(--on-dark);color:var(--on-dark);background:transparent;width:100%;}
-.st-key-able_chat .stButton>button:hover,.st-key-able_chat .stFormSubmitButton>button:hover{background:var(--paper);color:var(--ink);}
-.st-key-able_chat .stButton>button[kind="primary"]{background:var(--paper);color:var(--ink);border-color:var(--paper);font-weight:600;}
-.st-key-able_chat [data-baseweb="input"],.st-key-able_chat [data-baseweb="textarea"],.st-key-able_chat [data-baseweb="base-input"]{background:transparent!important;border-color:var(--on-dark-muted)!important;}
-.st-key-able_chat input,.st-key-able_chat textarea{color:var(--on-dark)!important;background:transparent!important;-webkit-text-fill-color:var(--on-dark);}
-.st-key-able_card{background:var(--card);padding:16px;}
-.able-label{font-size:11px;color:var(--on-dark-muted)!important;letter-spacing:.04em;display:block;margin-bottom:4px;}
-.able-you{margin:0 0 14px;font-size:14px;line-height:1.7;}
-.able-answer{margin:0 0 4px;font-size:16px;line-height:1.7;font-weight:300;}
-.able-tool{display:block;font-size:12px;color:var(--on-dark-muted)!important;}
-.able-gap{height:10px;}
-.able-mark-sm{font-family:'Inter',sans-serif;font-size:40px;font-weight:500;letter-spacing:-.05em;line-height:1;}
-.able-foot{font-size:11px;color:var(--on-dark-muted)!important;text-align:right;line-height:1.5;}
-.able-footer{margin-top:48px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:11px;color:var(--gray);letter-spacing:.04em;}
-.able-status{display:inline-flex;align-items:center;gap:8px;font-size:12px;background:#2F2F31;padding:6px 10px;float:right;margin-top:14px;}
-.able-status i{width:7px;height:7px;border-radius:50%;background:var(--on-dark);display:inline-block;}
+.block-container{padding:28px 32px 40px;max-width:1180px;}
+@media (max-width:1100px){.block-container{padding:20px 16px 32px;}}
+/* 사이드바 */
+[data-testid="stSidebar"]{background:rgba(255,255,255,.72);border-right:1px solid var(--sidebar-border);}
+[data-testid="stSidebar"] .stButton>button{width:100%;justify-content:flex-start;min-height:48px;border-radius:14px;border:none;background:transparent;color:var(--text);font-size:15px;box-shadow:none;}
+[data-testid="stSidebar"] .stButton>button:hover{background:var(--tint2);color:var(--text);border:none;}
+[data-testid="stSidebar"] .st-key-nav_assistant button[kind="primary"]{background:var(--primary);color:#fff;font-weight:500;}
+[data-testid="stSidebar"] .st-key-nav_tasks button[kind="primary"]{background:var(--task);color:#fff;font-weight:500;}
+[data-testid="stSidebar"] .st-key-nav_calendar button[kind="primary"]{background:var(--cal);color:#fff;font-weight:500;}
+[data-testid="stSidebar"] .st-key-nav_requests button[kind="primary"]{background:var(--primary);color:#fff;font-weight:500;}
+[data-testid="stSidebar"] .st-key-btn_reset button,[data-testid="stSidebar"] .st-key-btn_reset_yes button,[data-testid="stSidebar"] .st-key-btn_reset_no button{min-height:34px;font-size:12px;color:var(--muted);justify-content:center;border:1px solid var(--border);}
+[data-testid="stSidebar"] .st-key-btn_reset_yes button{color:#B91C1C;border-color:#FCA5A5;}
+.aivle-brand{display:flex;align-items:center;gap:10px;padding:4px 8px 12px;}
+.aivle-brand i{width:40px;height:40px;border-radius:12px;background:var(--primary);display:inline-flex;align-items:center;justify-content:center;color:#fff;font-style:normal;font-weight:700;}
+.aivle-wordmark{font-size:22px;font-weight:700;color:var(--text);}
+.aivle-conn{display:flex;flex-direction:column;gap:8px;padding:12px;border-radius:14px;background:#fff;font-size:13px;color:var(--text2);}
+.aivle-conn span{display:inline-flex;align-items:center;gap:6px;}
+.aivle-conn i{width:8px;height:8px;border-radius:50%;display:inline-block;flex:0 0 8px;}
+.aivle-steps{display:flex;flex-direction:column;gap:4px;padding:0 8px;font-size:12px;color:var(--muted);}
+.aivle-step{display:flex;align-items:center;gap:8px;}
+.aivle-step i{font-style:normal;width:18px;height:18px;border-radius:50%;border:1px solid var(--border);display:inline-flex;align-items:center;justify-content:center;font-size:11px;}
+.aivle-step-now{color:var(--text);font-weight:700;}
+.aivle-step-now i{background:var(--primary);color:#fff;border-color:var(--primary);}
+.aivle-step-done i{background:var(--cal-tint);color:var(--cal-text);border-color:var(--cal-tint);}
+/* 기본 버튼 */
+.stButton>button,.stFormSubmitButton>button{border-radius:12px;border:1px solid var(--border);background:#fff;color:var(--primary-text);font-size:14px;min-height:44px;padding:0 16px;box-shadow:none;white-space:normal;line-height:1.3;}
+.stButton>button:hover,.stFormSubmitButton>button:hover{border-color:var(--primary);color:var(--primary-text);background:var(--tint2);}
+.stButton>button[kind="primary"]{background:var(--primary);color:#fff;border-color:var(--primary);font-weight:500;}
+.stButton>button[kind="primary"]:hover{background:var(--primary-dark);color:#fff;border-color:var(--primary-dark);}
+.stButton>button:disabled{opacity:.5;}
+.st-key-page_tasks .stButton>button{color:var(--task);border-color:var(--task-border);}
+.st-key-page_tasks .stButton>button[kind="primary"]{background:var(--task);border-color:var(--task);color:#fff;}
+.st-key-page_tasks .stButton>button[kind="primary"]:hover{background:#1E40AF;border-color:#1E40AF;color:#fff;}
+.st-key-page_calendar .stButton>button{color:var(--cal);border-color:#A7F3D0;}
+.st-key-page_calendar .stButton>button[kind="primary"]{background:var(--cal);border-color:var(--cal);color:#fff;}
+[class*="st-key-chip_"] button{border-radius:999px;min-height:40px;}
+[class*="st-key-tlink_"] button{width:100%;justify-content:flex-start;text-align:left;border-color:var(--task-border);color:var(--text);border-radius:16px;background:#fff;}
+[class*="st-key-tlink_"] button:hover{background:var(--task-row);border-color:var(--task);color:var(--text);}
+[class*="st-key-up_"] button,[class*="st-key-sent_"] button{width:100%;justify-content:flex-start;text-align:left;border-radius:14px;color:var(--text);border-color:var(--tint);background:var(--tint2);min-height:40px;font-size:13px;}
+.st-key-card_chat .stFormSubmitButton>button{background:var(--dark);color:#fff;border-color:var(--dark);border-radius:999px;min-height:48px;font-weight:500;}
+.st-key-card_chat .stFormSubmitButton>button:hover{background:#312E81;color:#fff;}
+/* 입력: 밝은 바탕 + 어두운 글자 (상속에 맡기지 않음) */
+[data-baseweb="input"],[data-baseweb="base-input"],[data-baseweb="textarea"]{border-radius:14px!important;background:#fff!important;border-color:var(--border)!important;}
+.stApp input,.stApp textarea,[data-testid="stDialog"] input,[data-testid="stDialog"] textarea{color:var(--text)!important;-webkit-text-fill-color:var(--text)!important;}
+.stApp input::placeholder,.stApp textarea::placeholder{color:var(--muted)!important;-webkit-text-fill-color:var(--muted)!important;opacity:1;}
+.st-key-card_chat [data-baseweb="input"],.st-key-card_chat [data-baseweb="base-input"]{background:var(--tint2)!important;border-radius:999px!important;border-color:transparent!important;}
+[data-testid="stFileUploaderDropzone"]{border:1px dashed var(--primary);border-radius:16px;background:var(--tint2);}
+[data-testid="stFileUploader"] [data-testid="stWidgetLabel"] p{font-size:16px;font-weight:700;}
+/* 카드 */
+.st-key-card_meeting,.st-key-card_upload,.st-key-card_chat,.st-key-card_calendar,.st-key-card_upcoming,.st-key-card_sent,.st-key-card_empty,[class*="st-key-task_card_"],[class*="st-key-task_sel_"],[class*="st-key-req_"]{background:#fff;border-radius:24px;padding:20px 24px;box-shadow:var(--shadow);box-sizing:border-box;max-width:100%;min-width:0;}
+[class*="st-key-task_sel_"]{box-shadow:0 0 0 3px var(--task),0 16px 40px rgba(29,78,216,.15);}
+[class*="st-key-req_focus_"]{box-shadow:0 0 0 3px var(--primary),0 16px 40px rgba(91,75,224,.18);}
+.aivle-eyebrow{font-size:13px;color:var(--muted);margin:0;}
+.aivle-strong{font-size:16px;font-weight:700;margin:0;overflow-wrap:anywhere;}
+.aivle-h1{font-size:28px;font-weight:700;margin:0;line-height:1.3;}
+.aivle-h1 b{color:var(--task);}
+.aivle-hint{font-size:14px;color:var(--muted);margin:4px 0 0;line-height:1.6;}
+.aivle-note{font-size:14px;line-height:1.6;color:var(--text2);margin:8px 0 0;padding:10px 14px;border-radius:14px;background:#fff;border:1px solid var(--border);}
+.aivle-tag{display:inline-block;padding:4px 10px;border-radius:999px;background:var(--task-tint);color:var(--task);font-size:12px;font-weight:700;margin-right:6px;}
+.aivle-tag-p{background:var(--tint);color:var(--primary-text);}
+.aivle-tag-ok{background:var(--cal-tint);color:var(--cal-text);}
+.aivle-tag-x{background:#FEE2E2;color:#991B1B;}
+.aivle-tag-w{background:var(--warn-bg);color:var(--warn);}
+.aivle-num{width:40px;height:40px;border-radius:12px;background:var(--task-tint);color:var(--task);font-weight:700;display:inline-flex;align-items:center;justify-content:center;}
+.aivle-task-title{font-size:18px;font-weight:700;margin:0;}
+.aivle-task-meta{font-size:14px;color:var(--muted);margin:2px 0 0;}
+.aivle-warn{color:var(--warn);font-weight:500;}
+.aivle-done{display:inline-flex;align-items:center;gap:6px;min-height:40px;padding:0 14px;border-radius:12px;background:var(--cal-tint);color:var(--cal-text);font-size:14px;font-weight:500;margin-bottom:6px;}
+/* 대화 */
+.aivle-msg-u{display:flex;flex-direction:column;align-items:flex-end;gap:4px;margin:6px 0;}
+.aivle-msg-a{display:flex;flex-direction:column;align-items:flex-start;gap:4px;margin:6px 0;}
+.aivle-msg-label{font-size:12px;color:var(--muted);}
+.aivle-bubble-u{max-width:78%;background:var(--primary);color:#fff;padding:12px 16px;border-radius:20px 20px 4px 20px;font-size:15px;line-height:1.6;overflow-wrap:anywhere;word-break:keep-all;}
+.aivle-bubble-a{max-width:88%;background:var(--tint2);color:var(--text);padding:14px 18px;border-radius:20px 20px 20px 4px;font-size:15px;line-height:1.7;overflow-wrap:anywhere;word-break:keep-all;}
+.aivle-tool{display:block;font-size:12px;color:var(--primary-text);margin-top:6px;}
+/* 캘린더 (네이티브 그리드: 셀 = 컨테이너, 칩 = 버튼) */
+.aivle-legend{display:flex;gap:14px;font-size:13px;color:var(--text2);flex-wrap:wrap;margin-bottom:10px;}
+.aivle-legend span{display:inline-flex;align-items:center;gap:6px;}
+.aivle-legend i{width:12px;height:12px;border-radius:4px;display:inline-block;}
+.aivle-dow{text-align:center;color:var(--muted);font-size:13px;margin:0;}
+[class*="st-key-cell_"],[class*="st-key-cellt_"]{background:#F8FAFC;border-radius:14px;padding:6px 6px 4px;min-height:88px;box-sizing:border-box;}
+[class*="st-key-cellt_"]{background:#fff;border:2px solid var(--cal);}
+.aivle-daynum{font-size:13px;color:var(--muted);display:block;margin:0 0 2px 2px;}
+[class*="st-key-cellt_"] .aivle-daynum{color:var(--cal);font-weight:700;}
+[class*="st-key-cell_"] .stButton>button,[class*="st-key-cellt_"] .stButton>button{min-height:24px;padding:0 6px;font-size:11px;border-radius:6px;width:100%;justify-content:flex-start;line-height:1.2;}
+[class*="st-key-cell_"] .stButton>button p,[class*="st-key-cellt_"] .stButton>button p{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;font-size:11px;}
+[class*="st-key-evA_"] button{background:var(--primary)!important;color:#fff!important;border-color:var(--primary)!important;}
+[class*="st-key-evC_"] button{background:var(--cal-tint)!important;color:var(--cal-text)!important;border-color:var(--cal-tint)!important;}
+[class*="st-key-evP_"] button{background:#fff!important;color:var(--primary-text)!important;border:1px dashed var(--primary)!important;}
+[class*="st-key-evOK_"] button{background:var(--primary)!important;color:#fff!important;border-color:var(--primary)!important;}
+[class*="st-key-evX_"] button{background:#F1F5F9!important;color:#94A3B8!important;text-decoration:line-through;border-color:#E2E8F0!important;}
+[class*="st-key-evD_"] button{background:#E2E8F0!important;color:#64748B!important;border-color:#E2E8F0!important;}
+.aivle-more{font-size:11px;color:var(--muted);margin:0 0 0 4px;}
+/* 다이얼로그 */
+.aivle-dlg-count{font-size:12px;color:var(--muted);}
+.aivle-dlg-row{display:flex;gap:12px;padding:10px 0;border-bottom:1px solid var(--tint);}
+.aivle-dlg-k{flex:0 0 84px;font-size:12px;color:var(--muted);padding-top:2px;}
+.aivle-dlg-v{flex:1 1 auto;min-width:0;font-size:14px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;}
+.aivle-demo-note{font-size:12px;color:var(--warn);background:var(--warn-bg);padding:6px 10px;border-radius:10px;margin:8px 0;}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
 
 # =========================================================
-# 2) 상태
+# 2) 공용 저장소 — 앱 안 캘린더 (일정 + 협업·미팅 요청)
+#    st.cache_resource 로 만든 dict 를 모든 접속자가 공유한다 (같은 서버 프로세스가 살아 있는 동안).
+#    앱이 재시작/재배포되면 초기화되고 기본 일정이 다시 만들어진다.
 # =========================================================
-today = datetime.now(KST).date()
-
-DEFAULTS = {
-    "messages": [],              # [{"id","role","content","via","tools"}] user/assistant 만
-    "meeting_text": None,        # 회의록 원문
-    "meeting_name": None,        # 파일 이름
-    "meeting_date": today.isoformat(),
-    "briefing": None,            # {"title","participants","summary","facts"}
-    "tasks": [],                 # [{"id","title","detail","requester","due","suggested_due","suggest_reason","event_id"}]
-    "briefing_key": None,        # 마지막으로 분석한 (파일명, 해시, 날짜)
-    "pending_actions": [],       # 확인 대기 중인 도구 실행 (이메일/캘린더). 앞에서부터 하나씩 카드로 표시
-    "last_audio_hash": None,     # 같은 녹음을 두 번 처리하지 않기 위한 해시
-    "tts_audio": None,           # 최신 답변 음성(bytes)
-    "tts_autoplay": False,       # 최신 답변만 자동 재생
-    "brief_audio": None,         # 브리핑 듣기 음성
-    "brief_autoplay": False,
-    "local_events": [],          # 캘린더 미연결 시 앱 안에 기록한 일정
-    "cal_year": today.year,
-    "cal_month": today.month,
-    "picking_task": None,        # 날짜 선택 UI 가 열린 업무 id
-    "notice": None,              # (종류, 문구) 다음 화면에 한 번 표시
-}
-for k, v in DEFAULTS.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-
-def set_notice(kind, text):
-    """사용자에게 보여줄 안내/오류 (다음 rerun 에서 한 번 표시)"""
-    st.session_state.notice = (kind, text)
-
-
-# =========================================================
-# 3) 도구 함수 (순수 함수 중심)
-# =========================================================
-def esc(text):
-    """HTML 이스케이프 + 줄바꿈 유지"""
-    return html.escape(str(text or "")).replace("\n", "<br>")
-
-
 def parse_iso(s):
     """'YYYY-MM-DD' → date, 실패하면 None"""
     try:
@@ -227,16 +326,167 @@ def parse_iso(s):
         return None
 
 
-def fmt_due(iso):
-    """2026-11-13 → '11.13 FRI'"""
+def store_add(store, **fields):
+    """일정 1건 추가 → id. 기본 필드를 채운 뒤 fields 로 덮어쓴다"""
+    ev = {"id": uuid.uuid4().hex[:10], "title": "", "date": None, "start_time": None, "end_time": None, "description": "",
+          "source": "calendar", "task_id": None, "status": None, "kind": "event", "request_type": None, "subject": None,
+          "from": None, "to": [], "message": "", "reason": "", "decided_by": None,
+          "created": datetime.now(KST).isoformat(timespec="seconds")}
+    ev.update(fields)
+    with store["lock"]:
+        store["events"][ev["id"]] = ev
+        store["version"] += 1
+    return ev["id"]
+
+
+def store_update(store, event_id, **fields):
+    with store["lock"]:
+        ev = store["events"].get(event_id)
+        if not ev:
+            return False
+        ev.update(fields)
+        store["version"] += 1
+        return True
+
+
+def store_get(store, event_id):
+    with store["lock"]:
+        ev = store["events"].get(event_id)
+        return dict(ev) if ev else None
+
+
+def store_list(store, start_iso="0000-01-01", end_iso="9999-12-31"):
+    """기간 내 일정 (날짜·시간 순 복사본)"""
+    with store["lock"]:
+        items = [dict(e) for e in store["events"].values() if e["date"] and start_iso <= e["date"] <= end_iso]
+    return sorted(items, key=lambda e: (e["date"], e.get("start_time") or ""))
+
+
+def seed_store(store, today_iso):
+    """시연용 기본 일정: 오늘 '외부 미팅'(종일), 7일 뒤 '마케팅 일정 점검 회의'(10:00~11:00)"""
+    d = parse_iso(today_iso)
+    store_add(store, title="외부 미팅", date=d.isoformat(), source="calendar", description=f"{USER_NAME} 외부 미팅 (오늘 회의에 참석하지 못한 이유)")
+    store_add(store, title="마케팅 일정 점검 회의", date=(d + timedelta(days=7)).isoformat(), start_time="10:00", end_time="11:00",
+              source="calendar", description="신제품 마케팅 전체 일정 점검 (다음 주 회의)")
+
+
+def new_store(today_iso):
+    store = {"lock": threading.Lock(), "events": {}, "version": 0}
+    seed_store(store, today_iso)
+    return store
+
+
+def store_reset(store, today_iso):
+    with store["lock"]:
+        store["events"].clear()
+        store["version"] += 1
+    seed_store(store, today_iso)
+
+
+@st.cache_resource(show_spinner=False)
+def get_store():
+    return new_store(datetime.now(KST).date().isoformat())
+
+
+STORE = get_store()
+
+
+# =========================================================
+# 3) 상태
+# =========================================================
+today = datetime.now(KST).date()
+
+DEFAULTS = {
+    "page": "assistant",         # assistant / tasks / calendar / requests
+    "view_as": USER_NAME,        # 보기 모드: 김 대리(주인) 또는 팀원 이름
+    "qp_handled": False,         # 링크(?req=..&as=..) 처리 여부
+    "focus_request": None,       # 링크로 열린 요청 id
+    "messages": [],              # [{"id","role","content","via","tools":[[tool,status],...],"show_tasks"}]
+    "meeting_text": None,
+    "meeting_name": None,
+    "meeting_date": today.isoformat(),
+    "briefing": None,            # {"title","participants","summary","facts"}
+    "tasks": [],                 # [{"id","title","detail","requester","due","suggested_due","suggest_reason","event_id","done"}]
+    "briefing_key": None,
+    "show_uploader": False,
+    "selected_task": None,       # 대화의 업무 카드에서 고른 업무 id
+    "prefill": None,             # 다른 페이지에서 넘어오며 바로 보낼 문장
+    "drafts": {},                # task_id → 초안 텍스트
+    "draft_rev": {},             # task_id → 다시 쓴 횟수 (text_area 키 갱신용)
+    "draft_task": None,          # 초안 다이얼로그가 열린 업무 id
+    "open_event": None,          # 일정 다이얼로그가 열린 일정 id
+    "request_form": None,        # 협업·미팅 요청 다이얼로그 내용
+    "request_mode": "summary",
+    "reject_for": None,          # 거절 이유 입력 중인 요청 id
+    "req_status_seen": {},       # 요청 id → 마지막으로 본 상태 (변경 토스트용)
+    "pending_actions": [],       # 확인 대기 중인 작업 (이메일/캘린더)
+    "dlg_action_id": None,
+    "dlg_mode": "summary",
+    "emails_sent": 0,
+    "last_audio_hash": None,
+    "tts_audio": None,
+    "tts_autoplay": False,
+    "cal_year": today.year,
+    "cal_month": today.month,
+    "confirm_reset": False,
+    "notice": None,
+}
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+def set_notice(kind, text):
+    """사용자에게 보여줄 안내. kind: error(실제 실패) / warning / note(조용한 안내)"""
+    st.session_state.notice = (kind, text)
+
+
+def render_notice():
+    """notice 를 한 번 보여주고 지운다. 설정 누락은 조용한 안내, 실제 실패만 빨간 상자"""
+    if not st.session_state.notice:
+        return
+    kind, text = st.session_state.notice
+    st.session_state.notice = None
+    if kind == "error":
+        st.error(text)
+    elif kind == "warning":
+        st.warning(text)
+    else:
+        st.markdown(f'<p class="aivle-note">{esc(text)}</p>', unsafe_allow_html=True)
+
+
+def go(page, **updates):
+    """페이지 이동 + 상태 갱신 후 rerun"""
+    st.session_state.page = page
+    for k, v in updates.items():
+        st.session_state[k] = v
+    st.rerun()
+
+
+# =========================================================
+# 4) 도구 함수 (순수 함수 중심)
+# =========================================================
+def esc(text):
+    """HTML 이스케이프 + 줄바꿈 유지"""
+    return html.escape(str(text or "")).replace("\n", "<br>")
+
+
+def fmt_short(iso):
+    """2026-11-13 → '11.13'"""
     d = parse_iso(iso)
-    return f"{d.month:02d}.{d.day:02d} {WEEKDAY_EN[d.weekday()]}" if d else "— 미정"
+    return f"{d.month:02d}.{d.day:02d}" if d else "미정"
 
 
 def fmt_kor(iso):
     """2026-11-13 → '11/13 (금)'"""
     d = parse_iso(iso)
     return f"{d.month}/{d.day} ({WEEKDAY_KO[d.weekday()]})" if d else "미정"
+
+
+def fmt_kor_day(iso):
+    """2026-11-13 → '11월 13일 (금)'"""
+    d = parse_iso(iso)
+    return f"{d.month}월 {d.day}일 ({WEEKDAY_KO[d.weekday()]})" if d else "미정"
 
 
 def fmt_long_kor(iso):
@@ -250,6 +500,21 @@ def fmt_header_date(d):
     return f"{d.year}.{d.month:02d}.{d.day:02d} {WEEKDAY_EN[d.weekday()]}"
 
 
+def fmt_when(ev):
+    """일정의 날짜·시간 표시: '11월 11일 (수) 10:00~11:00' 또는 '... 종일'"""
+    base = fmt_kor_day(ev.get("date"))
+    if ev.get("start_time"):
+        return f"{base} {ev['start_time']}~{ev.get('end_time') or ''}".rstrip("~")
+    return f"{base} 종일"
+
+
+def end_time_of(start_hhmm, minutes):
+    """'10:00' + 60분 → '11:00'"""
+    h, m = [int(x) for x in start_hhmm.split(":")]
+    total = (h * 60 + m + int(minutes)) % (24 * 60)
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
 def trim_history(messages, max_turns=MAX_TURNS):
     """사용자 발화 기준으로 최근 max_turns 턴만 남긴다"""
     user_idx = [i for i, m in enumerate(messages) if m["role"] == "user"]
@@ -260,6 +525,32 @@ def trim_history(messages, max_turns=MAX_TURNS):
 
 def count_turns(messages):
     return sum(1 for m in messages if m["role"] == "user")
+
+
+def tool_lines(tools):
+    """[[tool, status], ...] → 한국어 결과 문구 목록 (같은 결과는 건수로 합침)"""
+    counts = {}
+    for item in tools or []:
+        key = (item[0], item[1])
+        counts[key] = counts.get(key, 0) + 1
+    lines = []
+    for key, n in counts.items():
+        label = TOOL_LABELS.get(key, f"{key[0]} {key[1]}")
+        if "{n}" in label:
+            lines.append(label.format(n=n))
+        else:
+            lines.append(label if n == 1 else f"{label} ×{n}")
+    return lines
+
+
+def mentions_tasks(user_text, answer, tasks):
+    """답변이 업무에 관한 것인지 (업무 카드를 붙일지) 판단"""
+    if not tasks:
+        return False
+    text = (user_text or "")
+    if any(k in text for k in ("업무", "할 일", "할일", "일정 등록", "마감", "배정")):
+        return True
+    return sum(1 for t in tasks if t["title"][:5] and t["title"][:5] in (answer or "")) >= 2
 
 
 def decode_text(raw):
@@ -281,8 +572,64 @@ def strip_for_speech(text):
     return " ".join(text.split())[:600]
 
 
-# ---- 이메일 (교안 send_email 과 동일) ----
+# ---- 단계 표시 / 설정 점검 ----
+def compute_steps(has_meeting, registered_any, emailed_any):
+    """(현재 단계, 끝난 단계 집합). ① 회의록 → ② 업무·일정 → ③ 부탁하기"""
+    done = set()
+    if has_meeting:
+        done.add(1)
+    if registered_any or emailed_any:
+        done.add(2)
+    if emailed_any:
+        done.add(3)
+    current = 1 if not has_meeting else (2 if 2 not in done else 3)
+    return current, done
+
+
+def stepper_html(current, done, labels=STEP_LABELS):
+    parts = ['<div class="aivle-steps">']
+    for i, label in enumerate(labels, 1):
+        cls = "aivle-step" + (" aivle-step-now" if i == current else "") + (" aivle-step-done" if i in done and i != current else "")
+        mark = "✓" if i in done else str(i)
+        parts.append(f'<span class="{cls}"><i>{mark}</i>{html.escape(label)}</span>')
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def missing_secrets(openai_key, gmail_address, gmail_password):
+    """빠진 Secrets 키 이름만 돌려준다 (값은 절대 다루지 않음)"""
+    missing = []
+    if not openai_key:
+        missing.append("OPENAI_API_KEY")
+    if not gmail_address:
+        missing.append("GMAIL_ADDRESS")
+    if not gmail_password:
+        missing.append("GMAIL_APP_PASSWORD")
+    return missing
+
+
+# ---- 주소록 / 데모 메일 ----
+def resolve_recipient(to, contacts, my_email):
+    """'팀장님' / 'teamlead@...' / 'me' → (표시 이름, 주소). 모르면 김 대리 본인"""
+    raw = (to or "").strip()
+    key = raw.replace("님", "").replace(" ", "")
+    for name, email in contacts:
+        if key and (key == name.replace(" ", "") or raw.lower() == (email or "").lower()):
+            return name, email
+    if "@" in raw:
+        return raw, raw
+    return USER_NAME, my_email
+
+
+def demo_envelope(to_label, to_email, subject, body, my_email):
+    """데모 발송: 실제 수신자는 항상 my_email. 제목·본문에 원래 받는 사람을 밝힌다"""
+    return (my_email,
+            f"[{APP_NAME} 데모 → {to_label}] {subject}",
+            f"(데모: 원래 받는 사람 {to_label} <{to_email}>)\n\n{body}")
+
+
 def send_email(to, subject, body):
+    """교안 send_email 과 동일 (Gmail SMTP). 실제 주소로 그대로 보낸다"""
     sender = GMAIL_ADDRESS
     password = GMAIL_APP_PASSWORD
     if not (sender and password):
@@ -305,72 +652,13 @@ def send_email(to, subject, body):
         return {"status": "failed", "error": str(e)}
 
 
-# ---- 구글 캘린더 ----
-def normalize_event(e):
-    """구글 이벤트 → 앱에서 쓰는 단순 dict. 에이블이 만든 일정은 source=able"""
-    start = e.get("start") or {}
-    day = start.get("date") or (start.get("dateTime") or "")[:10]
-    private = (e.get("extendedProperties") or {}).get("private") or {}
-    return {
-        "id": e.get("id"),
-        "title": e.get("summary") or "(제목 없음)",
-        "date": day,
-        "is_able": private.get("source") == "able",
-        "task_id": private.get("task_id"),
-    }
+def send_demo_email(to_label, to_email, subject, body):
+    """모든 메일을 MY_EMAIL 로 보내되 원래 받는 사람을 표시"""
+    actual_to, subject2, body2 = demo_envelope(to_label, to_email, subject, body, MY_EMAIL)
+    return send_email(actual_to, subject2, body2)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_events_cached(_service, calendar_id, start_iso, end_iso):
-    """기간 내 일정 조회 (60초 캐시). _service 는 해시 대상에서 제외"""
-    end_next = (parse_iso(end_iso) + timedelta(days=1)).isoformat()
-    result = _service.events().list(
-        calendarId=calendar_id,
-        timeMin=f"{start_iso}T00:00:00+09:00",
-        timeMax=f"{end_next}T00:00:00+09:00",
-        singleEvents=True,
-        orderBy="startTime",
-        maxResults=250,
-        timeZone="Asia/Seoul",
-    ).execute()
-    return [normalize_event(e) for e in result.get("items", [])]
-
-
-def get_events(start_iso, end_iso):
-    """(일정 목록, 오류 문구). 캘린더 미연결이면 앱 안 일정으로 대체"""
-    if not CAL_OK:
-        local = [e for e in st.session_state.local_events if start_iso <= e["date"] <= end_iso]
-        return local, CAL_SETUP_ERROR
-    try:
-        return fetch_events_cached(calendar_service, GOOGLE_CALENDAR_ID, start_iso, end_iso), None
-    except Exception as e:
-        return [], f"구글 캘린더 조회 실패: {e}"
-
-
-def insert_event(title, date_iso, description, task_id=None):
-    """종일 일정 등록. 에이블 표식(extendedProperties.private.source=able) 포함"""
-    d = parse_iso(date_iso)
-    body = {
-        "summary": title,
-        "description": description or "",
-        "start": {"date": d.isoformat()},
-        "end": {"date": (d + timedelta(days=1)).isoformat()},   # 종일 일정의 end 는 다음 날(배타)
-        "extendedProperties": {"private": {"source": "able", "task_id": task_id or ""}},
-    }
-    created = calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=body).execute()
-    fetch_events_cached.clear()
-    return created["id"]
-
-
-def find_existing_event(title, date_iso, events):
-    """같은 제목 + 같은 날짜 일정이 이미 있으면 반환 (중복 등록 방지)"""
-    key = (title or "").strip()
-    for ev in events:
-        if ev["date"] == date_iso and (ev["title"] or "").strip() == key:
-            return ev
-    return None
-
-
+# ---- 캘린더 표시 ----
 def events_by_date(events):
     grouped = {}
     for ev in events:
@@ -390,33 +678,89 @@ def shift_month(year, month, delta):
     return y, m
 
 
-def month_grid_html(year, month, grouped, today_iso, max_chips=3):
-    """월간 그리드 HTML (월요일 시작). 에이블 일정 = 채움, 그 외 = 테두리"""
-    parts = ['<div class="able-grid">']
-    for name in WEEKDAY_EN:
-        parts.append(f'<span class="able-grid-head">{name}</span>')
+def build_month_cells(year, month, grouped, today_iso, max_chips=3):
+    """월간 그리드 자료 (월요일 시작). 주 → 7칸, 빈칸은 None"""
+    weeks = []
     for week in cal_lib.Calendar(firstweekday=0).monthdayscalendar(year, month):
+        row = []
         for day in week:
             if day == 0:
-                parts.append('<div class="able-cell"></div>')
+                row.append(None)
                 continue
             iso = f"{year:04d}-{month:02d}-{day:02d}"
-            is_today = iso == today_iso
-            cls = "able-cell able-cell-today" if is_today else "able-cell"
-            num = f"{day} — today" if is_today else str(day)
-            chips = []
             evs = grouped.get(iso, [])
-            for ev in evs[:max_chips]:
-                chip_cls = "able-chip able-chip-fill" if ev.get("is_able") else "able-chip able-chip-line"
-                chips.append(f'<span class="{chip_cls}" title="{html.escape(str(ev["title"]))}">{html.escape(str(ev["title"]))}</span>')
-            if len(evs) > max_chips:
-                chips.append(f'<span class="able-more">+{len(evs) - max_chips}</span>')
-            parts.append(f'<div class="{cls}"><span class="able-daynum">{num}</span>{"".join(chips)}</div>')
-    parts.append("</div>")
-    return "".join(parts)
+            row.append({"day": day, "iso": iso, "is_today": iso == today_iso,
+                        "chips": evs[:max_chips], "more": max(0, len(evs) - max_chips)})
+        weeks.append(row)
+    return weeks
 
 
-# ---- 업무 / 확인 대기 작업 ----
+def chip_style(ev):
+    """칩 색: A(AIVLE 업무) C(캘린더 일정) P(요청 대기) OK(요청 확정) X(거절) D(완료)"""
+    if ev.get("kind") == "request":
+        return {"accepted": "OK", "rejected": "X"}.get(ev.get("status"), "P")
+    if ev.get("status") == "done":
+        return "D"
+    return "A" if ev.get("source") == "able" else "C"
+
+
+def chip_label(ev, width=11):
+    style = chip_style(ev)
+    title = ev.get("subject") if ev.get("kind") == "request" else ev.get("title", "")
+    title = title or ""
+    prefix = {"D": "✓ ", "P": "대기 ", "OK": "확정 ", "X": "거절 "}.get(style, "")
+    text = prefix + title
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def find_existing_event(title, date_iso, events):
+    """같은 제목 + 같은 날짜 일정이 이미 있으면 반환 (중복 등록 방지)"""
+    key = (title or "").strip()
+    for ev in events:
+        if ev["date"] == date_iso and (ev["title"] or "").strip() == key and ev.get("kind") != "request":
+            return ev
+    return None
+
+
+# ---- 협업·미팅 요청 ----
+def request_title(request_type, subject, status):
+    short = "미팅" if "미팅" in (request_type or "") else "협업"
+    if status == "accepted":
+        return f"[{short} 확정] {subject}"
+    if status == "rejected":
+        return f"[거절됨] {subject}"
+    return f"[{request_type}] {subject} — 대기"
+
+
+def apply_decision(event, decision, by, reason=""):
+    """수락/거절 → 일정에 반영할 필드. 거절은 이유가 필수"""
+    reason = (reason or "").strip()
+    if decision not in ("accepted", "rejected"):
+        raise ValueError("알 수 없는 결정입니다.")
+    if decision == "rejected" and not reason:
+        raise ValueError("거절 이유를 입력해 주세요.")
+    return {"status": decision, "decided_by": by, "reason": reason if decision == "rejected" else "",
+            "title": request_title(event.get("request_type"), event.get("subject"), decision)}
+
+
+def request_message(task, event, meeting_title):
+    """요청 메시지 기본 문구 (AIVLE 초안, 수정 가능)"""
+    if task:
+        due = fmt_kor_day(task["due"]) if task.get("due") else f"미정 (제안 {fmt_kor_day(task.get('suggested_due'))})"
+        return (f"안녕하세요, {USER_NAME}입니다.\n'{task['title']}' 업무 관련해 잠깐 시간을 내어 주실 수 있을까요?\n"
+                f"- 내용: {task['detail']}\n- 요청: {task['requester']} · 마감: {due}\n"
+                f"- 배경: 「{meeting_title or '회의'}」 회의에서 배정된 업무입니다.\n"
+                "가능한 시간대를 알려 주시면 맞추겠습니다. 감사합니다.")
+    title = event.get("title") if event else "일정"
+    return (f"안녕하세요, {USER_NAME}입니다.\n'{title}' 일정과 관련해 함께 논의할 시간을 요청드립니다.\n"
+            "가능한 시간대를 알려 주시면 맞추겠습니다. 감사합니다.")
+
+
+def request_link(event_id, name):
+    return f"{APP_URL}/?req={event_id}&as={quote(name)}" if APP_URL else ""
+
+
+# ---- 업무 ----
 def find_task(task_id):
     for t in st.session_state.tasks:
         if t["id"] == task_id:
@@ -434,8 +778,48 @@ def match_task_by_title(title):
     return None
 
 
-def new_message(role, content, via="text", tools=None):
-    return {"id": uuid.uuid4().hex[:8], "role": role, "content": content, "via": via, "tools": tools or []}
+def task_status(t):
+    """todo(추가 전) / scheduled(추가됨) / done(완료)"""
+    if t.get("done"):
+        return "done"
+    return "scheduled" if t.get("event_id") else "todo"
+
+
+def task_description(t):
+    return f"{t['detail']}\n요청: {t['requester']}\n출처: {st.session_state.meeting_name or '회의록'}"
+
+
+def task_due_label(t):
+    """'마감 11월 13일 (금)' 또는 '마감 미정 · AIVLE 제안 11월 9일 (월)'"""
+    if t.get("due"):
+        return "마감 " + fmt_kor_day(t["due"])
+    return f"마감 미정 · {APP_NAME} 제안 {fmt_kor_day(t.get('suggested_due'))}"
+
+
+def mark_task_done(t, done=True):
+    """업무 완료 표시 (캘린더 일정에도 저장 → 새로고침 후에도 유지)"""
+    t["done"] = done
+    if t.get("event_id"):
+        store_update(STORE, t["event_id"], status="done" if done else None)
+
+
+def restore_task_statuses():
+    """저장소의 AIVLE 일정에서 업무의 등록/완료 상태를 되살린다 (다른 기기·새 세션에서도 유지)"""
+    if not st.session_state.tasks:
+        return
+    able = [e for e in store_list(STORE) if e.get("source") == "able"]
+    for t in st.session_state.tasks:
+        ev = next((e for e in able if e.get("task_id") == t["id"] and e["title"].strip() == t["title"].strip()), None)
+        if ev:
+            t["event_id"], t["due"] = ev["id"], ev["date"]
+            t["done"] = ev.get("status") == "done"
+        elif t.get("event_id") and not store_get(STORE, t["event_id"]):
+            t["event_id"] = None            # 저장소가 초기화된 경우
+
+
+# ---- 대화 메시지 / 확인 대기 작업 ----
+def new_message(role, content, via="text", tools=None, show_tasks=False):
+    return {"id": uuid.uuid4().hex[:8], "role": role, "content": content, "via": via, "tools": tools or [], "show_tasks": show_tasks}
 
 
 def find_message(msg_id):
@@ -449,9 +833,8 @@ def queue_pending(tool_name, args, task_id=None, msg_id=None):
     """send_email / add_calendar_event 는 바로 실행하지 않고 확인 대기열에 넣는다"""
     args = dict(args or {})
     if tool_name == "send_email":
-        to = (args.get("to") or "").strip()
-        if "@" not in to:                      # 수신자를 모르면 기본 수신자
-            args["to"] = MY_EMAIL
+        label, email = resolve_recipient(args.get("to"), CONTACTS, MY_EMAIL)
+        args["to_label"], args["to_email"] = label, email
         kind = "email"
     else:
         kind = "calendar"
@@ -464,28 +847,42 @@ def queue_pending(tool_name, args, task_id=None, msg_id=None):
     return action
 
 
+def queue_task(t):
+    """업무 → 캘린더 추가 대기열 (마감 미정이면 제안 날짜를 기본값으로)"""
+    return queue_pending("add_calendar_event",
+                         {"title": t["title"], "date": t["due"] or t.get("suggested_due") or (today + timedelta(days=7)).isoformat(),
+                          "description": task_description(t)},
+                         task_id=t["id"])
+
+
 def remove_pending(action_id):
     st.session_state.pending_actions = [a for a in st.session_state.pending_actions if a["id"] != action_id]
 
 
+def current_action():
+    return st.session_state.pending_actions[0] if st.session_state.pending_actions else None
+
+
 def update_tool_status(action, status):
-    """'— send_email  waiting for you' 줄을 done / cancelled 로 바꾼다"""
+    """답변에 붙은 '확인 대기' 결과 줄을 done / cancelled 로 바꾼다"""
     m = find_message(action.get("msg_id")) if action.get("msg_id") else None
     if not m:
         return
-    m["tools"] = [f"{action['tool']}  {status}" if line.startswith(f"{action['tool']}  waiting") else line
-                  for line in m["tools"]]
+    for item in m["tools"]:
+        if item[0] == action["tool"] and item[1] == "waiting":
+            item[1] = status
+            break
 
 
-def append_assistant(content, tools=None, speak_it=True):
-    st.session_state.messages.append(new_message("assistant", content, tools=tools))
+def append_assistant(content, tools=None, speak_it=True, show_tasks=False):
+    st.session_state.messages.append(new_message("assistant", content, tools=tools, show_tasks=show_tasks))
     st.session_state.messages = trim_history(st.session_state.messages)
     if speak_it:
         speak(content)
 
 
 # =========================================================
-# 4) LLM
+# 5) LLM
 # =========================================================
 # ---- (a) 회의록 분석: JSON 스키마 구조화 출력 ----
 BRIEF_SCHEMA = {
@@ -522,7 +919,7 @@ BRIEF_SCHEMA = {
 def extract_briefing(meeting_text, meeting_date):
     """회의록 → (브리핑 dict, 업무 list). LLM 한 번 호출"""
     wd = WEEKDAY_KO[meeting_date.weekday()]
-    system = f"""당신은 회의록을 분석하는 비서 '에이블'입니다. 회의록에서 {USER_NAME}에게 필요한 정보를 JSON 으로 추출합니다.
+    system = f"""당신은 회의록을 분석하는 비서 '{APP_NAME}'입니다. 회의록에서 {USER_NAME}에게 필요한 정보를 JSON 으로 추출합니다.
 회의 날짜: {meeting_date.isoformat()} ({wd}요일)
 규칙:
 - tasks 에는 {USER_NAME}(김대리)에게 배정된 업무만 넣습니다. 다른 사람 업무는 제외합니다.
@@ -556,6 +953,7 @@ def extract_briefing(meeting_text, meeting_date):
             "suggested_due": suggested.isoformat() if suggested else None,
             "suggest_reason": reason or "",
             "event_id": None,
+            "done": False,
         })
     briefing = {
         "title": data.get("meeting_title") or "회의",
@@ -566,16 +964,61 @@ def extract_briefing(meeting_text, meeting_date):
     return briefing, tasks
 
 
-# ---- (b) 대화용 도구 정의 (Responses API function tools, 교안과 같은 형식) ----
+def load_meeting(text, name, meeting_date, key):
+    """회의록을 상태에 저장하고 분석. 분석이 끝나면 대화에 브리핑을 올리고 읽어 준다"""
+    st.session_state.meeting_text = text
+    st.session_state.meeting_name = name
+    st.session_state.meeting_date = meeting_date.isoformat()
+    st.session_state.briefing_key = key
+    st.session_state.briefing, st.session_state.tasks = None, []
+    st.session_state.selected_task = None
+    st.session_state.drafts, st.session_state.draft_rev = {}, {}
+    st.session_state.show_uploader = False
+    if client is None:
+        set_notice("note", "OPENAI_API_KEY 가 없어 회의록 분석은 건너뛰었어요. 회의록 원문은 기억해 둘게요. (사이드바 '설정 안내' 참고)")
+        return False
+    try:
+        with st.spinner(f"회의록을 읽고 {USER_NAME}님 업무를 찾는 중…"):
+            briefing, tasks = extract_briefing(text, meeting_date)
+        st.session_state.briefing, st.session_state.tasks = briefing, tasks
+        restore_task_statuses()
+        n = len(tasks)
+        brief_msg = (f"회의록을 읽었어요. 「{briefing['title']}」 회의에서 {USER_NAME}님께 업무 {n}건이 배정됐어요. "
+                     f"{briefing['summary']}" + (" 아래 업무를 눌러 자세히 보거나, 캘린더 추가와 메일 발송을 부탁해 주세요." if n else ""))
+        append_assistant(brief_msg, show_tasks=bool(n))
+        st.toast(f"회의록 분석 완료 — 업무 {n}건을 찾았어요")
+        return True
+    except Exception as e:
+        set_notice("error", f"회의록 분석에 실패했어요: {e} — 잠시 후 '다시 분석'을 눌러 주세요.")
+        return False
+
+
+# ---- (b) 업무 초안 작성 ----
+def generate_draft(task):
+    """회의 맥락 + 업무 → 바로 다듬어 쓸 수 있는 초안 (LLM)"""
+    system = (f"당신은 {USER_NAME}의 비서 '{APP_NAME}'입니다. 회의록의 결정 사항을 근거로 {USER_NAME}가 바로 다듬어 쓸 수 있는 업무 초안을 한국어로 작성합니다. "
+              "마크다운 기호 없이, 제목 한 줄 뒤에 번호 목록과 짧은 문단으로 구성합니다. 회의록에 없는 사실은 만들지 않고 '확인 필요'라고 표시합니다. 500자 안팎.")
+    user = (f"[업무] {task['title']}\n세부: {task['detail']}\n요청: {task['requester']}\n마감: {task.get('due') or task.get('suggested_due')}\n\n"
+            f"[회의록]\n{st.session_state.meeting_text or '(회의록 없음)'}")
+    response = client.responses.create(model=LLM_MODEL, input=[{"role": "system", "content": system}, {"role": "user", "content": user}])
+    return (response.output_text or "").strip()
+
+
+# ---- (c) 대화용 도구 정의 (Responses API function tools, 교안과 같은 형식) ----
+def address_book_text():
+    return ", ".join(f"{name} <{email}>" for name, email in CONTACTS)
+
+
 TOOLS = [
     {
         "type": "function",
         "name": "send_email",
-        "description": f"이메일을 발송합니다. {USER_NAME}가 '메일로 보내줘'처럼 명시적으로 요청할 때만 사용합니다. 실제 발송은 사용자 확인 후 이루어집니다.",
+        "description": (f"이메일을 발송합니다. {USER_NAME}가 '메일로 보내줘'처럼 명시적으로 요청할 때만 사용합니다. 실제 발송은 사용자 확인 후 이루어집니다. "
+                        f"to 에는 팀 주소록의 이름(김 대리, 팀장, 박과장, 이과장, 최대리) 또는 이메일 주소를 넣습니다. 주소록: {address_book_text()}"),
         "parameters": {
             "type": "object",
             "properties": {
-                "to": {"type": "string", "description": "이메일 수신자. 예: 'test@gmail.com'. 수신자를 모르면 기본 수신자 주소를 넣습니다."},
+                "to": {"type": "string", "description": "받는 사람. 주소록 이름(예: '팀장') 또는 이메일. 수신자를 말하지 않으면 '김 대리'"},
                 "subject": {"type": "string", "description": "이메일 제목. 예: '[회의 요약] 신제품 출시 마케팅 전략'"},
                 "body": {"type": "string", "description": "이메일 본문. 인사말, 핵심 요약, 업무 목록(마감 포함), 마무리로 구성한 완성된 한국어 메일"},
             },
@@ -587,7 +1030,7 @@ TOOLS = [
     {
         "type": "function",
         "name": "add_calendar_event",
-        "description": "업무 마감 등 일정을 에이블 캘린더에 종일 일정으로 등록합니다. 업무 하나당 한 번 호출합니다. 실제 등록은 사용자 확인 후 이루어집니다.",
+        "description": "업무 마감 등 일정을 AIVLE 캘린더에 종일 일정으로 등록합니다. 업무 하나당 한 번 호출합니다. 실제 등록은 사용자 확인 후 이루어집니다.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -603,7 +1046,7 @@ TOOLS = [
     {
         "type": "function",
         "name": "list_events",
-        "description": "기간 내 캘린더 일정을 조회합니다. 일정 관련 질문에 답하기 전에 호출합니다.",
+        "description": "기간 내 캘린더 일정(업무 마감, 회의, 협업·미팅 요청 상태)을 조회합니다. 일정 관련 질문에 답하기 전에 호출합니다.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -625,31 +1068,31 @@ def tool_list_events(start_date, end_date):
         return {"status": "failed", "error": "날짜 형식은 YYYY-MM-DD 여야 합니다."}
     if e < s:
         s, e = e, s
-    events, err = get_events(s.isoformat(), e.isoformat())
-    items = [{"date": ev["date"], "weekday": WEEKDAY_KO[parse_iso(ev["date"]).weekday()] if parse_iso(ev["date"]) else "",
-              "title": ev["title"], "created_by_able": ev.get("is_able", False)} for ev in events]
-    result = {"status": "success", "start_date": s.isoformat(), "end_date": e.isoformat(), "count": len(items), "events": items}
-    if not CAL_OK:
-        result["note"] = "구글 캘린더가 연결되지 않아 앱 안에 기록된 일정만 조회했습니다."
-    elif err:
-        result = {"status": "failed", "error": err}
-    return result
+    items = []
+    for ev in store_list(STORE, s.isoformat(), e.isoformat()):
+        d = parse_iso(ev["date"])
+        items.append({"date": ev["date"], "weekday": WEEKDAY_KO[d.weekday()] if d else "", "time": ev.get("start_time") or "종일",
+                      "title": ev["title"], "source": ev.get("source"), "status": ev.get("status"),
+                      "to": ev.get("to") if ev.get("kind") == "request" else None})
+    return {"status": "success", "start_date": s.isoformat(), "end_date": e.isoformat(), "count": len(items), "events": items}
 
 
 def build_system_prompt():
-    tasks_brief = [{k: t.get(k) for k in ("id", "title", "detail", "requester", "due", "suggested_due", "suggest_reason", "event_id")}
+    tasks_brief = [{k: t.get(k) for k in ("id", "title", "detail", "requester", "due", "suggested_due", "suggest_reason", "event_id", "done")}
                    for t in st.session_state.tasks]
     meeting = st.session_state.meeting_text
     lines = [
-        f"당신은 '에이블'입니다. 마케팅팀 {USER_NAME}의 개인 비서로, {USER_NAME}가 놓친 회의 내용을 정리하고 업무·일정·메일을 대신 처리합니다.",
+        f"당신은 '{APP_NAME}'입니다. 마케팅팀 {USER_NAME}의 개인 비서로, {USER_NAME}가 놓친 회의 내용을 정리하고 업무·일정·메일을 대신 처리합니다. "
+        f"사용자가 음성으로 '에이블'이라고 부르면 그것은 {APP_NAME}의 한국어 발음이며 당신을 부르는 말입니다. 스스로를 소개할 때는 {APP_NAME}이라고 합니다.",
         "말투: 간결한 한국어 존댓말. 답변은 2~4문장. 음성으로 읽히므로 마크다운, 이모지, 특수기호 없이 자연스러운 문장으로 말합니다. 여러 항목은 '첫째, 둘째'처럼 이어 말합니다.",
         f"오늘: {today.isoformat()} ({WEEKDAY_KO[today.weekday()]}요일). '이번 주'는 오늘이 속한 월요일부터 일요일, '다음 주'는 그 다음 주입니다.",
-        "회의록이 있으면 반드시 회의록 내용에 근거해 답하고, 회의록에 없는 내용은 추측하지 말고 없다고 말합니다. 회의록이 없으면 먼저 회의록(.txt)을 올려 달라고 안내합니다.",
+        "회의록이 있으면 반드시 회의록 내용에 근거해 답하고, 회의록에 없는 내용은 추측하지 말고 없다고 말합니다. 회의록이 없으면 화면 위의 '회의록 파일 올리기'에서 파일을 올리거나 샘플 회의록을 써 보라고 한 문장으로 안내합니다.",
+        f"팀 주소록: {address_book_text()}. '팀장님께 보내줘'처럼 이름으로 말하면 그 사람을 to 로 씁니다.",
         "도구 사용 규칙:",
-        f"- send_email: 사용자가 '메일로 보내줘', '이메일로 정리해줘'처럼 명시적으로 요청할 때만 호출합니다. 요약만 원하면 호출하지 않습니다. 수신자를 말하지 않으면 to 에 '{MY_EMAIL or 'me'}' 를 넣습니다.",
+        "- send_email: 사용자가 '메일로 보내줘', '이메일로 정리해줘'처럼 명시적으로 요청할 때만 호출합니다. 요약만 원하면 호출하지 않습니다. 수신자를 말하지 않으면 to 에 '김 대리' 를 넣습니다.",
         "- add_calendar_event: 업무나 마감을 캘린더에 넣어 달라고 할 때 호출합니다. 업무마다 한 번씩 호출하고, due 가 없는 업무는 suggested_due 를 쓰며 그 사실을 답변에서 알립니다. event_id 가 이미 있는 업무는 다시 등록하지 않습니다.",
-        "- list_events: 일정을 물으면 먼저 호출하고, 그 결과에 있는 일정만 말합니다.",
-        "- 도구 결과가 pending_confirmation 이면 '초안(또는 등록 내용)을 준비했으니 화면의 확인 카드에서 보내기/등록 버튼을 눌러 주세요'라고 짧게 안내합니다. 실제로 보냈다거나 등록했다고 말하지 마세요.",
+        "- list_events: 일정을 물으면 먼저 호출하고, 그 결과에 있는 일정만 말합니다. 협업·미팅 요청은 status(pending 대기 / accepted 확정 / rejected 거절)를 함께 말합니다.",
+        "- 도구 결과가 pending_confirmation 이면 '내용을 준비했으니 화면에 뜬 확인 창에서 추가(또는 보내기) 버튼을 눌러 주세요'라고 짧게 안내합니다. 실제로 보냈다거나 등록했다고 말하지 마세요.",
         "",
         f"[회의 정보] 회의 날짜: {st.session_state.meeting_date} / 파일: {st.session_state.meeting_name or '없음'}",
         f"[{USER_NAME}의 업무 목록 JSON]\n{json.dumps(tasks_brief, ensure_ascii=False)}",
@@ -660,7 +1103,7 @@ def build_system_prompt():
 
 def run_able(assistant_msg_id):
     """대화 1턴 처리. list_events 는 바로 실행해 결과를 모델에 돌려주고,
-    send_email / add_calendar_event 는 확인 대기열에 넣는다. (답변, 도구 상태 줄) 반환"""
+    send_email / add_calendar_event 는 확인 대기열에 넣는다. (답변, [[도구, 상태], ...]) 반환"""
     input_items = [{"role": "system", "content": build_system_prompt()}]
     input_items += [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
     statuses = []
@@ -683,17 +1126,17 @@ def run_able(assistant_msg_id):
 
             if call.name == "list_events":
                 result = tool_list_events(args.get("start_date", ""), args.get("end_date", ""))
-                statuses.append("list_events  done")
+                statuses.append(["list_events", "done"])
             elif call.name in ("send_email", "add_calendar_event"):
                 task = match_task_by_title(args.get("title")) if call.name == "add_calendar_event" else None
                 if task and task.get("event_id"):
                     result = {"status": "skipped", "reason": "이미 캘린더에 등록된 업무입니다."}
-                    statuses.append("add_calendar_event  skipped (already registered)")
+                    statuses.append(["add_calendar_event", "skipped"])
                 else:
                     queue_pending(call.name, args, task_id=task["id"] if task else None, msg_id=assistant_msg_id)
                     result = {"status": "pending_confirmation",
-                              "message": "사용자 확인 대기 중입니다. 화면의 확인 카드에서 버튼을 누르면 실행됩니다. 같은 도구를 다시 호출하지 마세요."}
-                    statuses.append(f"{call.name}  waiting for you")
+                              "message": "사용자 확인 대기 중입니다. 화면의 확인 창에서 버튼을 누르면 실행됩니다. 같은 도구를 다시 호출하지 마세요."}
+                    statuses.append([call.name, "waiting"])
                     made_pending = True
             else:
                 result = {"status": "failed", "error": f"알 수 없는 도구 {call.name}"}
@@ -705,11 +1148,11 @@ def run_able(assistant_msg_id):
 
     answer = (response.output_text or "").strip() if response else ""
     if not answer:
-        answer = "요청을 처리했어요. 화면의 확인 카드를 확인해 주세요." if st.session_state.pending_actions else "죄송해요, 답변을 만들지 못했어요. 다시 말씀해 주세요."
+        answer = "내용을 준비했어요. 화면에 뜬 확인 창을 확인해 주세요." if st.session_state.pending_actions else "죄송해요, 답변을 만들지 못했어요. 다시 말씀해 주세요."
     return answer, statuses
 
 
-# ---- (c) STT / TTS ----
+# ---- (d) STT / TTS ----
 def transcribe(audio_bytes):
     """음성 → 텍스트 (whisper-1)"""
     transcript = client.audio.transcriptions.create(
@@ -724,20 +1167,22 @@ def speak(text):
     if not client or not text:
         return
     speech_text = strip_for_speech(text)
-    for model in (TTS_MODEL, "tts-1"):
-        try:
-            speech = client.audio.speech.create(model=model, voice=TTS_VOICE, input=speech_text)
-            st.session_state.tts_audio = speech.content
-            st.session_state.tts_autoplay = True
-            return
-        except Exception as e:
-            err = e
-    set_notice("warning", f"음성 생성에 실패했어요: {err}")
+    err = None
+    with st.spinner("음성을 만드는 중…"):
+        for model in (TTS_MODEL, "tts-1"):
+            try:
+                speech = client.audio.speech.create(model=model, voice=TTS_VOICE, input=speech_text)
+                st.session_state.tts_audio = speech.content
+                st.session_state.tts_autoplay = True
+                return
+            except Exception as e:
+                err = e
+    set_notice("note", f"음성 생성에 실패해 글로만 답했어요. ({err})")
 
 
-# ---- (d) 사용자 메시지 1건 처리 ----
+# ---- (e) 사용자 메시지 1건 처리 ----
 def handle_user_message(text, via, box):
-    """사용자 발화 추가 → 에이블 답변 → 음성 → rerun"""
+    """사용자 발화 추가 → AIVLE 답변 → 음성 → rerun"""
     text = (text or "").strip()
     if not text:
         return
@@ -748,80 +1193,101 @@ def handle_user_message(text, via, box):
     with box:
         render_message(user_msg)
         if client is None:
-            answer, statuses = "OPENAI_API_KEY 가 설정되지 않아 답변할 수 없어요. Secrets 를 확인해 주세요.", []
+            answer, statuses = "OPENAI_API_KEY 가 설정되지 않아 답변할 수 없어요. 사이드바 '설정 안내'를 확인해 주세요.", []
         else:
-            with st.spinner("에이블이 생각하고 있어요..."):
+            with st.spinner(f"{APP_NAME}이 생각하는 중…"):
                 try:
                     answer, statuses = run_able(assistant_id)
                 except Exception as e:
-                    answer, statuses = f"죄송해요, 답변 중 오류가 났어요. ({e})", []
-    msg = new_message("assistant", answer, tools=statuses)
-    msg["id"] = assistant_id
-    st.session_state.messages.append(msg)
-    st.session_state.messages = trim_history(st.session_state.messages)
-    speak(answer)
+                    answer, statuses = f"죄송해요, 답변 중 오류가 났어요. 잠시 후 다시 말씀해 주세요. ({e})", []
+        msg = new_message("assistant", answer, tools=statuses, show_tasks=mentions_tasks(text, answer, st.session_state.tasks))
+        msg["id"] = assistant_id
+        st.session_state.messages.append(msg)
+        st.session_state.messages = trim_history(st.session_state.messages)
+        speak(answer)
     st.rerun()
 
 
-# ---- (e) 확인 카드 실행 ----
-def execute_email(action, to, subject, body):
-    to = (to or "").strip()
-    if "@" not in to:
-        set_notice("error", "수신자 이메일 주소를 확인해 주세요.")
-        return
-    with st.spinner("메일을 보내고 있어요..."):
-        result = send_email(to, subject.strip(), body)
-    if result.get("status") == "success":
-        remove_pending(action["id"])
-        update_tool_status(action, "done")
-        append_assistant(f"{to} 로 메일을 보냈어요. 제목은 '{subject.strip()}' 입니다.", tools=["send_email  done"])
-        st.toast("메일을 보냈어요.")
-    else:
-        set_notice("error", f"메일 발송에 실패했어요: {result.get('error')}")
-
-
-def execute_calendar(action, title, date_iso, description):
+# ---- (f) 확인 후 실행 ----
+def do_calendar(action, title, date_iso, description):
+    """캘린더 등록 1건. ('ok'|'skip'|'fail', 안내 문장). 실패하면 notice 를 남기고 대기열에 그대로 둔다"""
     title = (title or "").strip()
     if not title or not parse_iso(date_iso):
         set_notice("error", "일정 제목과 날짜를 확인해 주세요.")
-        return
+        return "fail", None
     task = find_task(action.get("task_id")) or match_task_by_title(title)
 
     # 중복 방지 1: 이미 등록된 업무
-    if task and task.get("event_id"):
+    if task and task.get("event_id") and store_get(STORE, task["event_id"]):
         remove_pending(action["id"])
         update_tool_status(action, "skipped")
-        set_notice("info", f"'{task['title']}' 은(는) 이미 캘린더에 등록돼 있어요.")
-        return
+        return "skip", f"'{task['title']}' 은(는) 이미 캘린더에 있어요."
 
-    # 중복 방지 2: 같은 제목 + 같은 날짜 일정이 캘린더에 있음
-    events, _ = get_events(date_iso, date_iso)
-    existing = find_existing_event(title, date_iso, events)
+    # 중복 방지 2: 같은 제목 + 같은 날짜 일정이 이미 있음
+    existing = find_existing_event(title, date_iso, store_list(STORE, date_iso, date_iso))
     if existing:
         event_id = existing["id"]
-        answer = f"{fmt_long_kor(date_iso)}에 '{title}' 일정이 이미 있어서 그대로 두었어요."
+        text = f"{fmt_long_kor(date_iso)}에 '{title}' 일정이 이미 있어서 그대로 두었어요."
     else:
-        try:
-            if CAL_OK:
-                with st.spinner("캘린더에 등록하고 있어요..."):
-                    event_id = insert_event(title, date_iso, description, task["id"] if task else None)
-                answer = f"{fmt_long_kor(date_iso)}에 '{title}' 을(를) 캘린더에 등록했어요."
-            else:
-                event_id = "local-" + uuid.uuid4().hex[:8]
-                st.session_state.local_events.append({"id": event_id, "title": title, "date": date_iso, "is_able": True,
-                                                      "task_id": task["id"] if task else None})
-                answer = f"{fmt_long_kor(date_iso)}에 '{title}' 을(를) 앱 안 캘린더에 기록했어요. 구글 캘린더는 연결되지 않았어요."
-        except Exception as e:
-            set_notice("error", f"캘린더 등록에 실패했어요: {e}")
-            return
+        event_id = store_add(STORE, title=title, date=date_iso, description=description or "", source="able",
+                             task_id=task["id"] if task else None)
+        text = f"{fmt_long_kor(date_iso)}에 '{title}' 을(를) 캘린더에 추가했어요."
 
     if task:
         task["due"] = date_iso
         task["event_id"] = event_id
     remove_pending(action["id"])
     update_tool_status(action, "done")
-    append_assistant(answer, tools=["add_calendar_event  done"])
-    st.toast("캘린더에 등록했어요.")
+    return "ok", text
+
+
+def execute_calendar(action, title, date_iso, description):
+    status, text = do_calendar(action, title, date_iso, description)
+    if status == "ok":
+        append_assistant(text, tools=[["add_calendar_event", "done"]])
+        st.toast("캘린더에 추가했어요.")
+    elif status == "skip":
+        set_notice("note", text)
+
+
+def execute_calendar_all():
+    """대기열의 캘린더 작업을 모두 실행 (제안 날짜 그대로)"""
+    done_texts, skip_texts = [], []
+    for a in list(st.session_state.pending_actions):
+        if a["type"] != "calendar":
+            continue
+        args = a["args"]
+        status, text = do_calendar(a, args.get("title"), args.get("date"), args.get("description"))
+        if status == "ok":
+            done_texts.append(text)
+        elif status == "skip":
+            skip_texts.append(text)
+    if done_texts:
+        append_assistant(" ".join(done_texts), tools=[["add_calendar_event", "done"]] * len(done_texts))
+        st.toast(f"캘린더에 {len(done_texts)}건 추가했어요.")
+    elif skip_texts:
+        set_notice("note", " ".join(skip_texts))
+
+
+def execute_email(action, to_label, to_email, subject, body):
+    """확인된 메일 발송 (데모: 실제 수신은 MY_EMAIL)"""
+    if "@" not in (to_email or ""):
+        set_notice("error", "받는 사람 이메일 주소를 확인해 주세요. (예: name@gmail.com)")
+        return
+    if not GMAIL_OK:
+        set_notice("note", "Gmail 이 설정되지 않아 메일을 보낼 수 없어요. 사이드바 '설정 안내'를 열어 GMAIL_ADDRESS, GMAIL_APP_PASSWORD 를 추가한 뒤 다시 '보내기'를 눌러 주세요.")
+        return
+    with st.spinner("메일을 보내는 중…"):
+        result = send_demo_email(to_label, to_email, subject.strip(), body)
+    if result.get("status") == "success":
+        remove_pending(action["id"])
+        update_tool_status(action, "done")
+        st.session_state.emails_sent += 1
+        append_assistant(f"{to_label}에게 메일을 보냈어요. 제목은 '{subject.strip()}' 입니다. 데모라서 실제로는 {MY_EMAIL} 로 도착해요.",
+                         tools=[["send_email", "done"]])
+        st.toast(f"메일을 보냈어요 → {MY_EMAIL}")
+    else:
+        set_notice("error", f"메일 발송에 실패했어요: {result.get('error')} — Secrets 의 GMAIL_ADDRESS / GMAIL_APP_PASSWORD(앱 비밀번호 16자리)를 확인하고 다시 '보내기'를 눌러 주세요.")
 
 
 def cancel_action(action):
@@ -830,305 +1296,889 @@ def cancel_action(action):
     st.session_state.tts_autoplay = False
 
 
-# =========================================================
-# 5) 화면
-# =========================================================
-def render_message(m):
-    """대화 말풍선 (HTML). YOU — 음성 인식 / ABLE"""
-    if m["role"] == "user":
-        label = "YOU — 음성 인식" if m.get("via") == "voice" else "YOU"
-        st.markdown(f'<span class="able-label">{label}</span><p class="able-you">{esc(m["content"])}</p>', unsafe_allow_html=True)
+def dismiss_current_action():
+    """확인 창을 X 나 바깥 클릭으로 닫으면 '취소'와 같게 처리"""
+    a = current_action()
+    if a:
+        cancel_action(a)
+
+
+# ---- (g) 협업·미팅 요청 보내기 / 응답 ----
+def open_request(task=None, event=None):
+    """요청 다이얼로그 기본값 채우기"""
+    subject = task["title"] if task else (event or {}).get("title", "일정")
+    if task and task.get("due"):
+        d = parse_iso(task["due"])
+    elif event and event.get("date"):
+        d = parse_iso(event["date"])
     else:
-        tools_html = "".join(f'<span class="able-tool">— {esc(line)}</span>' for line in m.get("tools", []))
-        st.markdown(f'<span class="able-label">ABLE</span><p class="able-answer">{esc(m["content"])}</p>{tools_html}<div class="able-gap"></div>',
-                    unsafe_allow_html=True)
+        d = today + timedelta(days=1)
+    st.session_state.request_form = {
+        "task_id": task["id"] if task else None, "event_id": (event or {}).get("id"), "subject": subject,
+        "to": [TEAMMATES[0]], "type": REQUEST_TYPES[0], "date": (d if d and d >= today else today + timedelta(days=1)).isoformat(),
+        "start": "10:00", "duration": 60,
+        "message": request_message(task, event, (st.session_state.briefing or {}).get("title")),
+    }
+    st.session_state.request_mode = "summary"
 
 
-incoming = None          # 이번 rerun 에 처리할 사용자 발화 (텍스트)
-incoming_via = "text"
-
-# 이번 달 일정 (헤더 상태 표시에도 쓰므로 먼저 조회)
-cal_y, cal_m = st.session_state.cal_year, st.session_state.cal_month
-m_start, m_end = month_range(cal_y, cal_m)
-month_events, cal_fetch_error = get_events(m_start, m_end)
-calendar_connected = CAL_OK and not cal_fetch_error
-
-# ---- 헤더 ----
-meta = [
-    f"{USER_NAME} 전용 AI 비서",
-    fmt_header_date(today),
-    "openai — " + ("connected" if client else "not connected"),
-    "google calendar — " + ("connected" if calendar_connected else "not connected"),
-    "gmail — " + ("connected" if GMAIL_OK else "not connected"),
-]
-st.markdown(
-    '<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:16px;">'
-    '<h1 class="able-wordmark">able.</h1>'
-    f'<div class="able-meta">{"<br>".join(meta)}</div></div>'
-    '<div class="able-tagline"><span>회의록을 읽고, 내 업무를 찾고, 일정과 메일로 정리합니다.</span>'
-    f'<span class="able-muted">source — {esc(st.session_state.meeting_name or "회의록 없음")}</span></div>',
-    unsafe_allow_html=True,
-)
-
-left, right = st.columns([3, 2], gap="large")
-
-# =========================
-# 왼쪽: 01 브리핑 / 02 내 업무 / 03 캘린더
-# =========================
-with left:
-    # ---- 01 브리핑 ----
-    st.markdown('<div class="able-section">01 — 브리핑</div>', unsafe_allow_html=True)
-    u1, u2 = st.columns([3, 1.3], vertical_alignment="bottom")
-    uploaded = u1.file_uploader("회의록 (.txt)", type=["txt"], label_visibility="collapsed")
-    meeting_date_input = u2.date_input("회의 날짜", value=parse_iso(st.session_state.meeting_date) or today, format="YYYY-MM-DD")
-
-    # 새 파일 또는 새 날짜가 들어왔을 때만 다시 분석
-    if uploaded is not None:
-        raw = uploaded.getvalue()
-        key = (uploaded.name, hashlib.md5(raw).hexdigest(), meeting_date_input.isoformat())
-        if key != st.session_state.briefing_key:
-            st.session_state.briefing_key = key
-            st.session_state.meeting_text = decode_text(raw)
-            st.session_state.meeting_name = uploaded.name
-            st.session_state.meeting_date = meeting_date_input.isoformat()
-            st.session_state.picking_task = None
-            if client is None:
-                set_notice("error", "OPENAI_API_KEY 가 없어 회의록을 분석할 수 없어요. 회의록 원문은 기억해 둘게요.")
+def send_request(form):
+    """요청을 공용 캘린더에 '대기' 일정으로 저장 + 받는 사람에게 메일 (앱 링크 포함)"""
+    end = end_time_of(form["start"], form["duration"])
+    eid = store_add(STORE, title=request_title(form["type"], form["subject"], "pending"), date=form["date"],
+                    start_time=form["start"], end_time=end, description=form["message"], source="request", kind="request",
+                    status="pending", request_type=form["type"], subject=form["subject"], **{"from": USER_NAME},
+                    to=list(form["to"]), task_id=form.get("task_id"), message=form["message"])
+    sent, failed = 0, []
+    for name in form["to"]:
+        link = request_link(eid, name)
+        body = (f"{form['message']}\n\n[일시] {fmt_kor_day(form['date'])} {form['start']}~{end} ({form['duration']}분)\n"
+                + (f"[수락/거절하기] {link}\n" if link else "") + f"\n— {APP_NAME} (김 대리의 AI 비서)")
+        if GMAIL_OK:
+            result = send_demo_email(name, CONTACT_EMAIL.get(name, ""), f"[{form['type']}] {form['subject']} — {USER_NAME}", body)
+            if result.get("status") == "success":
+                sent += 1
             else:
-                try:
-                    with st.spinner("회의록을 읽고 김 대리님 업무를 찾고 있어요..."):
-                        briefing, tasks = extract_briefing(st.session_state.meeting_text, meeting_date_input)
-                    st.session_state.briefing, st.session_state.tasks = briefing, tasks
-                    st.toast(f"회의록 분석 완료 — 업무 {len(tasks)}건")
-                except Exception as e:
-                    set_notice("error", f"회의록 분석에 실패했어요: {e}")
+                failed.append(f"{name}: {result.get('error')}")
+    st.session_state.req_status_seen[eid] = "pending"
+    names = ", ".join(form["to"])
+    text = (f"{names}에게 '{form['subject']}' {form['type']}을 보냈어요. {fmt_kor_day(form['date'])} {form['start']}부터 {form['duration']}분이에요. "
+            + ("답장이 오면 캘린더 상태가 바뀌어요." if sent else "메일은 보내지 못했지만 요청은 캘린더에 대기 상태로 올렸어요."))
+    append_assistant(text, tools=[["request", "sent"]] * max(1, len(form["to"])))
+    if failed:
+        set_notice("error", "일부 메일 발송 실패: " + "; ".join(failed) + " — Gmail 설정을 확인해 주세요.")
+    elif not GMAIL_OK:
+        set_notice("note", "Gmail 이 설정되지 않아 메일은 보내지 않았어요. 요청은 캘린더에 올라갔고, 사이드바 '보기 모드'로 팀원 화면을 확인할 수 있어요.")
+    st.toast(f"{form['type']}을 보냈어요" + (f" (메일 {sent}통 → {MY_EMAIL})" if sent else ""))
+    return eid
 
-    b = st.session_state.briefing
-    if b:
-        n = len(st.session_state.tasks)
-        lead = f"놓친 회의 「{b['title']}」에서 {USER_NAME}님께 업무 {n}건이 배정됐습니다."
-        facts = " · ".join(esc(f) for f in b["facts"])
-        st.markdown(f'<p class="able-lead">{esc(lead)}</p><p class="able-sub">{esc(b["summary"])}</p>'
-                    f'<p class="able-sub">{facts}</p>', unsafe_allow_html=True)
-        a1, a2, _ = st.columns([1.2, 1.2, 3])
-        if a1.button("브리핑 듣기 →", key="btn_brief_tts"):
-            if client is None:
-                set_notice("error", "OPENAI_API_KEY 가 없어 음성을 만들 수 없어요.")
-            else:
-                try:
-                    speech = client.audio.speech.create(model=TTS_MODEL, voice=TTS_VOICE, input=strip_for_speech(lead + " " + b["summary"]))
-                    st.session_state.brief_audio, st.session_state.brief_autoplay = speech.content, True
-                except Exception as e:
-                    set_notice("error", f"브리핑 음성 생성 실패: {e}")
-        if a2.button("메일로 받기 →", key="btn_brief_mail"):
-            incoming = "회의 요약과 내 업무를 정리해서 내 메일로 보내줘"
-        if st.session_state.brief_audio:
-            st.audio(st.session_state.brief_audio, format="audio/mp3", autoplay=st.session_state.brief_autoplay)
-            st.session_state.brief_autoplay = False
-    elif st.session_state.meeting_text:
-        st.markdown('<p class="able-hint">회의록은 기억하고 있지만 분석 결과가 없어요.</p>', unsafe_allow_html=True)
-        if st.button("다시 분석", key="btn_reanalyze") and client is not None:
-            try:
-                with st.spinner("회의록을 다시 읽고 있어요..."):
-                    briefing, tasks = extract_briefing(st.session_state.meeting_text, parse_iso(st.session_state.meeting_date) or today)
-                st.session_state.briefing, st.session_state.tasks = briefing, tasks
+
+def decide_request(ev, decision, by, reason=""):
+    """팀원이 수락/거절 → 일정 상태 갱신 + 김 대리에게 알림 메일"""
+    updates = apply_decision(ev, decision, by, reason)          # 거절 이유 없으면 ValueError
+    store_update(STORE, ev["id"], **updates)
+    verb = "수락" if decision == "accepted" else "거절"
+    body = (f"{by}님이 '{ev.get('subject')}' {ev.get('request_type')}을 {verb}했어요.\n"
+            f"[일시] {fmt_when(ev)}\n" + (f"[거절 이유] {updates['reason']}\n" if decision == "rejected" else "")
+            + f"\n— {APP_NAME}")
+    if GMAIL_OK:
+        send_demo_email(USER_NAME, MY_EMAIL, f"[{verb}] {ev.get('subject')} — {by}", body)
+    st.toast(f"{verb}했어요. {USER_NAME}에게 알림을 보냈어요." if GMAIL_OK else f"{verb}했어요.")
+
+
+# =========================================================
+# 6) 다이얼로그 (한 실행에 하나만 연다)
+#    - 대기열/상태가 있으면 매 실행마다 열어 준다. 결정 후 st.rerun() 으로 닫는다.
+# =========================================================
+def dlg_row(key, value):
+    st.markdown(f'<div class="aivle-dlg-row"><span class="aivle-dlg-k">{esc(key)}</span><span class="aivle-dlg-v">{esc(value)}</span></div>',
+                unsafe_allow_html=True)
+
+
+def dlg_prepare(action):
+    """작업이 바뀌면 읽기 모드로 되돌린다. (대기 건수, 모두 캘린더인지) 반환"""
+    if st.session_state.dlg_action_id != action["id"]:
+        st.session_state.dlg_action_id = action["id"]
+        st.session_state.dlg_mode = "summary"
+    total = len(st.session_state.pending_actions)
+    all_calendar = all(a["type"] == "calendar" for a in st.session_state.pending_actions)
+    if total > 1:
+        st.markdown(f'<span class="aivle-dlg-count">확인할 작업 1 / {total}</span>', unsafe_allow_html=True)
+    render_notice()
+    return total, all_calendar
+
+
+@st.dialog("캘린더에 추가할까요?", width="medium", on_dismiss=dismiss_current_action)
+def calendar_dialog():
+    action = current_action()
+    if not action or action["type"] != "calendar":
+        return
+    aid, args = action["id"], action["args"]
+    total, all_calendar = dlg_prepare(action)
+    task = find_task(action.get("task_id"))
+    undated = bool(task) and not task.get("due")          # 마감 미정 업무: AIVLE 제안 / 직접 지정
+    skip_label = "건너뛰기" if total > 1 else "취소"
+
+    if st.session_state.dlg_mode == "summary":
+        dlg_row("일정 제목", args.get("title", ""))
+        date_iso = args.get("date")
+        if undated:
+            sd = task.get("suggested_due") or date_iso
+            options = [f"{APP_NAME} 제안: {fmt_kor(sd)} — {task.get('suggest_reason') or '회의 후 1주'}", "직접 지정"]
+            choice = st.radio("날짜", options, key=f"dlg_radio_{aid}")
+            date_iso = sd
+            if choice == "직접 지정":
+                date_iso = st.date_input("직접 지정", value=parse_iso(sd) or today, key=f"dlg_date_{aid}", format="YYYY-MM-DD").isoformat()
+        else:
+            dlg_row("날짜", fmt_long_kor(date_iso))
+        dlg_row("메모", args.get("description", ""))
+
+        b1, b2, b3 = st.columns([1.4, 1, 1])
+        if b1.button("추가", key=f"dlg_add_{aid}", type="primary"):
+            execute_calendar(action, args.get("title"), date_iso, args.get("description"))
+            st.rerun()
+        if b2.button("수정하기", key=f"dlg_edit_{aid}"):
+            st.session_state.dlg_mode = "edit"
+            st.rerun()
+        if b3.button(skip_label, key=f"dlg_cancel_{aid}"):
+            cancel_action(action)
+            st.rerun()
+        if total > 1 and all_calendar:
+            if st.button(f"남은 {total}건 모두 그대로 추가", key=f"dlg_addall_{aid}"):
+                execute_calendar_all()
                 st.rerun()
-            except Exception as e:
-                set_notice("error", f"회의록 분석에 실패했어요: {e}")
     else:
-        st.markdown('<p class="able-hint">회의록(.txt)을 올리고 회의 날짜를 고르면, 요약과 김 대리님의 업무를 바로 찾아 드려요.</p>',
-                    unsafe_allow_html=True)
+        title = st.text_input("일정 제목", value=args.get("title", ""), key=f"dlg_etitle_{aid}")
+        d = st.date_input("날짜", value=parse_iso(args.get("date")) or today, key=f"dlg_edate_{aid}", format="YYYY-MM-DD")
+        desc = st.text_area("메모", value=args.get("description", ""), height=120, key=f"dlg_edesc_{aid}")
+        b1, b2 = st.columns([1.4, 1])
+        if b1.button("저장하고 추가", key=f"dlg_save_{aid}", type="primary"):
+            st.session_state.dlg_mode = "summary"
+            execute_calendar(action, title, d.isoformat(), desc)
+            st.rerun()
+        if b2.button("돌아가기", key=f"dlg_back_{aid}"):
+            st.session_state.dlg_mode = "summary"
+            st.rerun()
 
-    # ---- 02 내 업무 ----
-    st.markdown('<div class="able-section">02 — 내 업무</div>', unsafe_allow_html=True)
-    tasks = st.session_state.tasks
-    if not tasks:
-        st.markdown('<p class="able-hint">회의록을 올리면 김 대리님께 배정된 업무가 여기에 정리됩니다.</p>', unsafe_allow_html=True)
+
+@st.dialog("메일을 보낼까요?", width="medium", on_dismiss=dismiss_current_action)
+def email_dialog():
+    action = current_action()
+    if not action or action["type"] != "email":
+        return
+    aid, args = action["id"], action["args"]
+    total, _ = dlg_prepare(action)
+    skip_label = "건너뛰기" if total > 1 else "취소"
+    st.markdown(f'<p class="aivle-demo-note">데모 모드: 모든 메일은 {esc(MY_EMAIL)} 으로 발송돼요. 제목에 원래 받는 사람이 표시됩니다.</p>', unsafe_allow_html=True)
+
+    if st.session_state.dlg_mode == "summary":
+        dlg_row("받는 사람", f"{args.get('to_label')} <{args.get('to_email')}>")
+        dlg_row("제목", args.get("subject", ""))
+        dlg_row("본문", args.get("body", ""))
+        b1, b2, b3 = st.columns([1.4, 1, 1])
+        if b1.button("보내기", key=f"dlg_send_{aid}", type="primary"):
+            execute_email(action, args.get("to_label"), args.get("to_email"), args.get("subject", ""), args.get("body", ""))
+            st.rerun()
+        if b2.button("수정하기", key=f"dlg_edit_{aid}"):
+            st.session_state.dlg_mode = "edit"
+            st.rerun()
+        if b3.button(skip_label, key=f"dlg_cancel_{aid}"):
+            cancel_action(action)
+            st.rerun()
     else:
-        st.markdown('<div class="able-rule-dark"></div>', unsafe_allow_html=True)
-        for i, t in enumerate(tasks):
-            c1, c2, c3, c4 = st.columns([0.5, 4.3, 1.4, 2.2], vertical_alignment="center")
-            c1.markdown(f'<span class="able-no">{i + 1:02d}</span>', unsafe_allow_html=True)
-            detail = esc(t["detail"]) + (f' · 요청 {esc(t["requester"])}' if t.get("requester") else "")
-            c2.markdown(f'<span class="able-task-title">{esc(t["title"])}</span><span class="able-task-detail">{detail}</span>',
-                        unsafe_allow_html=True)
-            if t["due"]:
-                c3.markdown(f'<span class="able-due">{fmt_due(t["due"])}</span>', unsafe_allow_html=True)
-            else:
-                c3.markdown('<span class="able-due able-muted">— 미정</span>', unsafe_allow_html=True)
+        names = [name for name, _ in CONTACTS] + ["직접 입력"]
+        default = args.get("to_label") if args.get("to_label") in names else "직접 입력"
+        pick = st.selectbox("받는 사람", names, index=names.index(default), key=f"dlg_eto_{aid}")
+        if pick == "직접 입력":
+            to_email = st.text_input("이메일 주소", value=args.get("to_email") if args.get("to_label") not in CONTACT_EMAIL else "", key=f"dlg_eto_free_{aid}")
+            to_label = to_email
+        else:
+            to_label, to_email = pick, CONTACT_EMAIL[pick]
+        subject = st.text_input("제목", value=args.get("subject", ""), key=f"dlg_esubject_{aid}")
+        body = st.text_area("본문", value=args.get("body", ""), height=220, key=f"dlg_ebody_{aid}")
+        b1, b2 = st.columns([1.4, 1])
+        if b1.button("저장하고 보내기", key=f"dlg_save_{aid}", type="primary"):
+            st.session_state.dlg_mode = "summary"
+            args.update(to_label=to_label, to_email=to_email, subject=subject, body=body)
+            execute_email(action, to_label, to_email, subject, body)
+            st.rerun()
+        if b2.button("돌아가기", key=f"dlg_back_{aid}"):
+            st.session_state.dlg_mode = "summary"
+            st.rerun()
 
-            with c4:
-                if t.get("event_id"):
-                    st.markdown('<span class="able-registered"><i></i>캘린더 등록됨</span>', unsafe_allow_html=True)
-                elif t["due"]:
-                    if st.button("캘린더에 추가", key=f"btn_add_{t['id']}"):
-                        queue_pending("add_calendar_event",
-                                      {"title": t["title"], "date": t["due"],
-                                       "description": f"{t['detail']}\n요청: {t['requester']}\n출처: {st.session_state.meeting_name or '회의록'}"},
-                                      task_id=t["id"])
-                        st.rerun()
-                else:
-                    label = "닫기" if st.session_state.picking_task == t["id"] else "날짜 정하기 +"
-                    if st.button(label, key=f"btn_pick_{t['id']}"):
-                        st.session_state.picking_task = None if st.session_state.picking_task == t["id"] else t["id"]
-                        st.rerun()
 
-            # 마감 미정 업무: 에이블 제안 / 직접 지정
-            if st.session_state.picking_task == t["id"] and not t["due"]:
-                sd = t.get("suggested_due") or (today + timedelta(days=7)).isoformat()
-                options = [f"에이블 제안: {fmt_kor(sd)} — {t.get('suggest_reason') or '회의 후 1주'}", "직접 지정"]
-                choice = st.radio("마감일", options, key=f"radio_{t['id']}", label_visibility="collapsed")
-                chosen = sd
-                if choice == "직접 지정":
-                    picked = st.date_input("날짜", value=parse_iso(sd) or today, key=f"date_{t['id']}", format="YYYY-MM-DD")
-                    chosen = picked.isoformat()
-                if st.button(f"{fmt_kor(chosen)} 로 캘린더에 추가", key=f"btn_pickok_{t['id']}"):
-                    queue_pending("add_calendar_event",
-                                  {"title": t["title"], "date": chosen,
-                                   "description": f"{t['detail']}\n요청: {t['requester']}\n출처: {st.session_state.meeting_name or '회의록'}"},
-                                  task_id=t["id"])
-                    st.session_state.picking_task = None
+def close_event():
+    st.session_state.open_event = None
+
+
+@st.dialog("일정", width="medium", on_dismiss=close_event)
+def event_dialog():
+    ev = store_get(STORE, st.session_state.open_event)
+    if not ev:
+        st.markdown('<p class="aivle-hint">일정을 찾을 수 없어요. (데모 데이터가 초기화됐을 수 있어요)</p>', unsafe_allow_html=True)
+        if st.button("닫기", key="ev_close_missing"):
+            close_event()
+            st.rerun()
+        return
+    render_notice()
+    is_owner = st.session_state.view_as == USER_NAME
+    is_request = ev.get("kind") == "request"
+    task = find_task(ev.get("task_id")) if ev.get("task_id") else None
+
+    dlg_row("제목", ev["title"])
+    dlg_row("일시", fmt_when(ev))
+    kind_label = "협업·미팅 요청" if is_request else (f"{APP_NAME}이 추가한 업무" if ev.get("source") == "able" else "캘린더 일정")
+    dlg_row("구분", kind_label)
+    if is_request:
+        status_kr = {"pending": "대기 (답장 전)", "accepted": f"확정 — {ev.get('decided_by') or ''}", "rejected": f"거절됨 — {ev.get('decided_by') or ''}"}.get(ev.get("status"), ev.get("status"))
+        dlg_row("상태", status_kr)
+        dlg_row("보낸 사람", ev.get("from") or "")
+        dlg_row("받는 사람", ", ".join(ev.get("to") or []))
+        if ev.get("reason"):
+            dlg_row("거절 이유", ev["reason"])
+        dlg_row("메시지", ev.get("message") or "")
+    else:
+        if ev.get("status") == "done":
+            dlg_row("상태", "✓ 완료")
+        dlg_row("메모", ev.get("description") or "")
+
+    if is_owner:
+        cols = st.columns(3)
+        if not is_request:
+            if cols[0].button("협업·미팅 요청", key="ev_req", type="primary"):
+                open_request(task=task, event=ev)
+                close_event()
+                st.rerun()
+            if task and ev.get("source") == "able":
+                if ev.get("status") != "done" and cols[1].button("완료 표시", key="ev_done"):
+                    mark_task_done(task, True)
+                    close_event()
+                    st.toast("완료로 표시했어요.")
                     st.rerun()
-            st.markdown('<div class="able-rule"></div>', unsafe_allow_html=True)
+                if cols[2].button("초안 맡기기", key="ev_draft"):
+                    st.session_state.draft_task = task["id"]
+                    close_event()
+                    st.rerun()
+        if st.button("닫기", key="ev_close"):
+            close_event()
+            st.rerun()
+    else:
+        me = st.session_state.view_as
+        if is_request and me in (ev.get("to") or []) and ev.get("status") == "pending":
+            if st.button("받은 요청에서 수락/거절하기", key="ev_go_requests", type="primary"):
+                close_event()
+                go("requests", focus_request=ev["id"])
+        if st.button("닫기", key="ev_close2"):
+            close_event()
+            st.rerun()
 
-    # ---- 03 캘린더 ----
-    st.markdown('<div class="able-section">03 — 캘린더</div>', unsafe_allow_html=True)
-    n1, n2, n3, n4, n5 = st.columns([0.5, 0.5, 2.6, 1.1, 2.3], vertical_alignment="center")
-    if n1.button("‹", key="btn_prev"):
-        st.session_state.cal_year, st.session_state.cal_month = shift_month(cal_y, cal_m, -1)
+
+def close_request():
+    st.session_state.request_form = None
+
+
+@st.dialog("협업·미팅 요청", width="medium", on_dismiss=close_request)
+def request_dialog():
+    form = st.session_state.request_form
+    if not form:
+        return
+    render_notice()
+    st.markdown(f'<p class="aivle-demo-note">데모 모드: 요청 메일은 모두 {esc(MY_EMAIL)} 으로 발송돼요. 팀원 화면은 사이드바 \'보기 모드\'나 메일의 링크로 확인할 수 있어요.</p>',
+                unsafe_allow_html=True)
+    if st.session_state.request_mode == "summary":
+        dlg_row("받는 사람", ", ".join(form["to"]) or "(선택 필요)")
+        dlg_row("종류", form["type"])
+        dlg_row("일시", f"{fmt_kor_day(form['date'])} {form['start']}~{end_time_of(form['start'], form['duration'])} ({form['duration']}분)")
+        dlg_row("관련 업무", form["subject"])
+        dlg_row("메시지", form["message"])
+        b1, b2, b3 = st.columns([1.4, 1, 1])
+        if b1.button("보내기", key="rq_send", type="primary", disabled=not form["to"]):
+            send_request(form)
+            close_request()
+            st.rerun()
+        if b2.button("수정하기", key="rq_edit"):
+            st.session_state.request_mode = "edit"
+            st.rerun()
+        if b3.button("취소", key="rq_cancel"):
+            close_request()
+            st.rerun()
+    else:
+        to = st.multiselect("받는 사람", TEAMMATES, default=form["to"], key="rq_to")
+        rtype = st.radio("종류", REQUEST_TYPES, index=REQUEST_TYPES.index(form["type"]), horizontal=True, key="rq_type")
+        c1, c2, c3 = st.columns(3)
+        d = c1.date_input("날짜", value=parse_iso(form["date"]) or today, key="rq_date", format="YYYY-MM-DD")
+        h, m = [int(x) for x in form["start"].split(":")]
+        t = c2.time_input("시작 시간", value=time(h, m), step=timedelta(minutes=30), key="rq_start")
+        dur = c3.selectbox("소요 시간", DURATIONS, index=DURATIONS.index(form["duration"]), format_func=lambda x: f"{x}분", key="rq_dur")
+        msg = st.text_area("메시지", value=form["message"], height=180, key="rq_msg")
+        b1, b2 = st.columns([1.4, 1])
+        if b1.button("저장", key="rq_save", type="primary"):
+            form.update(to=to, type=rtype, date=d.isoformat(), start=t.strftime("%H:%M"), duration=dur, message=msg)
+            st.session_state.request_mode = "summary"
+            st.rerun()
+        if b2.button("돌아가기", key="rq_back"):
+            st.session_state.request_mode = "summary"
+            st.rerun()
+
+
+def close_draft():
+    st.session_state.draft_task = None
+
+
+@st.dialog(f"{APP_NAME} 초안", width="large", on_dismiss=close_draft)
+def draft_dialog():
+    task = find_task(st.session_state.draft_task)
+    if not task:
+        return
+    tid = task["id"]
+    render_notice()
+    st.markdown(f'<p class="aivle-eyebrow">{esc(task["title"])} · {esc(task_due_label(task))}</p>', unsafe_allow_html=True)
+    if tid not in st.session_state.drafts:
+        if client is None:
+            st.session_state.drafts[tid] = "(OPENAI_API_KEY 가 없어 초안을 쓸 수 없어요. 이 칸에 직접 작성해도 됩니다.)"
+        else:
+            try:
+                with st.spinner(f"{APP_NAME}이 초안을 쓰는 중…"):
+                    st.session_state.drafts[tid] = generate_draft(task)
+                st.toast("초안을 썼어요. 수정해서 쓰세요.")
+            except Exception as e:
+                st.session_state.drafts[tid] = ""
+                set_notice("error", f"초안 작성에 실패했어요: {e} — '다시 쓰기'를 눌러 주세요.")
+    rev = st.session_state.draft_rev.get(tid, 0)
+    text = st.text_area("초안 (수정 가능)", value=st.session_state.drafts.get(tid, ""), height=320, key=f"draft_ta_{tid}_{rev}")
+    st.session_state.drafts[tid] = text
+    b1, b2, b3 = st.columns([1, 1.4, 1])
+    if b1.button("다시 쓰기", key=f"draft_again_{tid}", disabled=client is None):
+        st.session_state.drafts.pop(tid, None)
+        st.session_state.draft_rev[tid] = rev + 1
         st.rerun()
-    if n2.button("›", key="btn_next"):
-        st.session_state.cal_year, st.session_state.cal_month = shift_month(cal_y, cal_m, 1)
+    if b2.button("메일로 보내기", key=f"draft_mail_{tid}", type="primary", disabled=not text.strip()):
+        queue_pending("send_email", {"to": USER_NAME, "subject": f"[초안] {task['title']}", "body": text}, task_id=tid)
+        close_draft()
         st.rerun()
-    n3.markdown(f'<span class="able-month">{cal_lib.month_name[cal_m]} {cal_y}</span>', unsafe_allow_html=True)
-    if n4.button("새로고침", key="btn_refresh"):
-        fetch_events_cached.clear()
+    if b3.button("닫기", key=f"draft_close_{tid}"):
+        close_draft()
         st.rerun()
-    n5.markdown('<div class="able-legend"><span><i style="border:1px solid #1C1C1C;"></i>구글 캘린더</span>'
-                '<span><i style="background:#1C1C1C;"></i>에이블 등록</span></div>', unsafe_allow_html=True)
 
-    st.markdown(month_grid_html(cal_y, cal_m, events_by_date(month_events), today.isoformat()), unsafe_allow_html=True)
-    if not CAL_OK:
-        st.markdown(f'<p class="able-hint">구글 캘린더가 연결되지 않아 앱 안에 기록한 일정만 보여요. ({esc(CAL_SETUP_ERROR)})</p>',
-                    unsafe_allow_html=True)
-    elif cal_fetch_error:
-        st.markdown(f'<p class="able-hint">{esc(cal_fetch_error)}</p>', unsafe_allow_html=True)
 
-# =========================
-# 오른쪽: 대화 패널
-# =========================
-with right:
-    with st.container(key="able_strip"):
-        status = "speaking" if st.session_state.tts_autoplay else "ready"
-        st.markdown(f'<span class="able-mark-sm">able.</span><span class="able-status"><i></i>{status}</span>',
-                    unsafe_allow_html=True)
+def render_dialogs():
+    """우선순위: 확인 대기(캘린더/메일) → 요청 작성 → 초안 → 일정 보기"""
+    action_now = current_action()
+    if action_now:
+        calendar_dialog() if action_now["type"] == "calendar" else email_dialog()
+    elif st.session_state.request_form:
+        request_dialog()
+    elif st.session_state.draft_task:
+        draft_dialog()
+    elif st.session_state.open_event:
+        event_dialog()
 
-    with st.container(key="able_chat"):
-        # 안내/오류 (한 번만)
-        if st.session_state.notice:
-            kind, text = st.session_state.notice
-            st.session_state.notice = None
-            {"error": st.error, "warning": st.warning, "info": st.info}.get(kind, st.info)(text)
 
-        # 대화 기록
-        messages_box = st.container()
-        with messages_box:
-            if not st.session_state.messages:
-                st.markdown('<span class="able-label">ABLE</span><p class="able-answer">안녕하세요, 에이블이에요. 회의록을 올려 주시면 요약하고 업무를 정리해 드릴게요. '
-                            '마이크나 메시지로 말을 걸어 주세요.</p>', unsafe_allow_html=True)
-            for idx, m in enumerate(st.session_state.messages):
+# =========================================================
+# 7) 화면
+# =========================================================
+def build_context():
+    has_meeting = st.session_state.meeting_text is not None
+    registered_any = any(t.get("event_id") for t in st.session_state.tasks)
+    emailed_any = st.session_state.emails_sent > 0
+    step_now, steps_done = compute_steps(has_meeting, registered_any, emailed_any)
+    cal_y, cal_m = st.session_state.cal_year, st.session_state.cal_month
+    m_start, m_end = month_range(cal_y, cal_m)
+    all_events = store_list(STORE)
+    return {
+        "has_meeting": has_meeting, "step_now": step_now, "steps_done": steps_done,
+        "cal_y": cal_y, "cal_m": cal_m,
+        "month_events": [e for e in all_events if m_start <= e["date"] <= m_end],
+        "all_events": all_events,
+        "is_owner": st.session_state.view_as == USER_NAME,
+    }
+
+
+def render_message(m):
+    """대화 말풍선 (HTML). 나 · 음성 / 나 · 입력 / AIVLE"""
+    if m["role"] == "user":
+        label = "나 · 음성" if m.get("via") == "voice" else "나 · 입력"
+        st.markdown(f'<div class="aivle-msg-u"><span class="aivle-msg-label">{label}</span>'
+                    f'<div class="aivle-bubble-u">{esc(m["content"])}</div></div>', unsafe_allow_html=True)
+    else:
+        tools_html = "".join(f'<span class="aivle-tool">— {esc(line)}</span>' for line in tool_lines(m.get("tools")))
+        st.markdown(f'<div class="aivle-msg-a"><span class="aivle-msg-label">{APP_NAME}</span>'
+                    f'<div class="aivle-bubble-a">{esc(m["content"])}{tools_html}</div></div>', unsafe_allow_html=True)
+
+
+def render_task_links(msg_id):
+    """답변 아래 업무 카드 (버튼 행). 누르면 '내 업무' 페이지에서 그 업무를 펼쳐 보여준다"""
+    for i, t in enumerate(st.session_state.tasks):
+        state = {"done": " · ✓ 완료", "scheduled": " · ✓ 캘린더에 추가됨"}.get(task_status(t), "")
+        label = f"{i + 1}  {t['title']}  ·  {task_due_label(t)}{state}   —  내 업무에서 보기 →"
+        if st.button(label, key=f"tlink_{msg_id}_{t['id']}"):
+            go("tasks", selected_task=t["id"])
+
+
+def render_sidebar(ctx):
+    """사이드바: 브랜드, 보기 모드, 메뉴, 단계, 연결 상태, 설정 안내, 데모 초기화"""
+    with st.sidebar:
+        st.markdown(f'<div class="aivle-brand"><i>A</i><span class="aivle-wordmark">{APP_NAME}</span></div>', unsafe_allow_html=True)
+
+        # 보기 모드 (시연: 팀원 화면으로 전환)
+        names = [USER_NAME] + TEAMMATES
+        picked = st.selectbox("보기 모드", names, index=names.index(st.session_state.view_as), key="view_mode_select",
+                              help="팀원을 고르면 그 사람이 받은 요청을 처리하는 화면이 돼요.")
+        if picked != st.session_state.view_as:
+            st.session_state.view_as = picked
+            st.session_state.page = "assistant" if picked == USER_NAME else "requests"
+            st.rerun()
+        is_owner = picked == USER_NAME
+        page = st.session_state.page
+
+        if is_owner:
+            n_tasks = len(st.session_state.tasks)
+            if st.button(PAGES["assistant"], key="nav_assistant", type="primary" if page == "assistant" else "secondary"):
+                go("assistant")
+            if st.button(PAGES["tasks"] + (f"  ({n_tasks})" if n_tasks else ""), key="nav_tasks", type="primary" if page == "tasks" else "secondary"):
+                go("tasks")
+            if st.button(PAGES["calendar"], key="nav_calendar", type="primary" if page == "calendar" else "secondary"):
+                go("calendar")
+            st.markdown("<div style='height:12px'></div>" + stepper_html(ctx["step_now"], ctx["steps_done"]), unsafe_allow_html=True)
+        else:
+            n_req = sum(1 for e in ctx["all_events"] if e.get("kind") == "request" and e.get("status") == "pending" and picked in (e.get("to") or []))
+            if st.button(f"{PAGES['requests']}  ({n_req})", key="nav_requests", type="primary" if page == "requests" else "secondary"):
+                go("requests")
+            if st.button(PAGES["calendar"], key="nav_calendar", type="primary" if page == "calendar" else "secondary"):
+                go("calendar")
+            st.markdown(f'<p class="aivle-hint">{esc(picked)} 화면 — {USER_NAME}가 보낸 협업·미팅 요청을 수락/거절할 수 있어요.</p>', unsafe_allow_html=True)
+
+        # 연결 상태 (캘린더는 앱 안 저장소라 항상 사용 가능)
+        def dot(ok):
+            return f'<i style="background:{"#10B981" if ok else "#C4C4D4"}"></i>'
+        st.markdown('<div style="height:16px"></div><div class="aivle-conn">'
+                    f'<span>{dot(bool(client))}OpenAI {"연결됨" if client else "설정 필요"}</span>'
+                    f'<span>{dot(GMAIL_OK)}Gmail {"연결됨" if GMAIL_OK else "설정 필요"}</span>'
+                    f'<span style="color:var(--muted)">메일은 모두 {esc(MY_EMAIL)} 로 발송 (데모)</span>'
+                    f'<span style="color:var(--muted)">캘린더: 앱 안 저장소 (재시작 시 초기화)</span>'
+                    f'<span style="color:var(--muted)">{fmt_header_date(today)}</span></div>', unsafe_allow_html=True)
+
+        missing = missing_secrets(OPENAI_API_KEY, GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+        if missing:
+            with st.expander("설정 안내", expanded=False):
+                st.markdown("빠진 Secrets 키: " + ", ".join(f"`{k}`" for k in missing))
+                st.markdown(
+                    "- Streamlit Community Cloud → 앱 ⋮ → **Settings → Secrets** 에 키를 추가하면 앱이 자동으로 다시 시작돼요.\n"
+                    "- `OPENAI_API_KEY` 가 없으면 대화·분석·음성이, `GMAIL_*` 이 없으면 메일 발송이 동작하지 않아요.\n"
+                    f"- `MY_EMAIL`(선택): 모든 데모 메일이 도착할 주소. 없으면 `{DEFAULT_MY_EMAIL}` 을 써요.\n"
+                    "- `APP_URL`(선택): 요청 메일에 넣을 이 앱의 주소. 자세한 순서는 **Secrets 설정 가이드.md** 를 보세요."
+                )
+
+        # 데모 데이터 초기화 (확인 후 실행)
+        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+        if not st.session_state.confirm_reset:
+            if st.button("데모 데이터 초기화", key="btn_reset"):
+                st.session_state.confirm_reset = True
+                st.rerun()
+        else:
+            st.markdown('<p class="aivle-hint">모든 접속자의 일정·요청이 지워지고 기본 일정만 남아요.</p>', unsafe_allow_html=True)
+            r1, r2 = st.columns(2)
+            if r1.button("초기화", key="btn_reset_yes"):
+                store_reset(STORE, today.isoformat())
+                for t in st.session_state.tasks:
+                    t["event_id"], t["done"] = None, False
+                st.session_state.pending_actions = []
+                st.session_state.req_status_seen = {}
+                st.session_state.confirm_reset = False
+                st.toast("데모 데이터를 초기화했어요.")
+                st.rerun()
+            if r2.button("취소", key="btn_reset_no"):
+                st.session_state.confirm_reset = False
+                st.rerun()
+
+
+def render_meeting_strip(ctx):
+    """회의록 카드: 불러온 회의록 요약 + [다른 회의록 올리기]. 없으면(또는 다시 열면) 업로드 블록"""
+    has_meeting = ctx["has_meeting"]
+    show_upload = (not has_meeting) or st.session_state.show_uploader
+
+    if has_meeting and not show_upload:
+        b = st.session_state.briefing
+        title = f" · {b['title']}" if b else ""
+        with st.container(key="card_meeting"):
+            c1, c2 = st.columns([3, 1.1], vertical_alignment="center")
+            c1.markdown('<p class="aivle-eyebrow">지금 읽고 있는 회의록</p>'
+                        f'<p class="aivle-strong">{esc(st.session_state.meeting_name)}{esc(title)} · {fmt_kor_day(st.session_state.meeting_date)}</p>',
+                        unsafe_allow_html=True)
+            if c2.button("다른 회의록 올리기", key="btn_other_meeting"):
+                st.session_state.show_uploader = True
+                st.rerun()
+        return
+
+    with st.container(key="card_upload"):
+        st.markdown('<p class="aivle-eyebrow">① 먼저 회의록을 올려 주세요</p>', unsafe_allow_html=True)
+        u1, u2 = st.columns([2.2, 1], vertical_alignment="top")
+        uploaded = u1.file_uploader("회의록 파일(.txt) 올리기", type=["txt"], key="uploader")
+        meeting_date_input = u2.date_input("회의 날짜", value=parse_iso(st.session_state.meeting_date) or today, format="YYYY-MM-DD",
+                                           help="회의가 열린 날짜예요. 마감 계산의 기준이 됩니다.")
+        u2.markdown('<p class="aivle-hint">\'다음 주까지\' 같은 마감을 이 날짜 기준으로 계산해요</p>', unsafe_allow_html=True)
+        s1, s2, _ = st.columns([1.6, 0.8, 2.6])
+        if s1.button("샘플 회의록으로 해보기", key="btn_sample"):
+            key = ("sample", hashlib.md5(SAMPLE_MEETING.encode("utf-8")).hexdigest(), meeting_date_input.isoformat())
+            if key == st.session_state.briefing_key:
+                st.session_state.show_uploader = False
+                st.toast("이미 불러온 샘플 회의록이에요.")
+            else:
+                load_meeting(SAMPLE_MEETING, SAMPLE_MEETING_NAME, meeting_date_input, key)
+            st.rerun()
+        if has_meeting and s2.button("닫기", key="btn_close_uploader"):
+            st.session_state.show_uploader = False
+            st.rerun()
+        if uploaded is not None:
+            raw = uploaded.getvalue()
+            key = (uploaded.name, hashlib.md5(raw).hexdigest(), meeting_date_input.isoformat())
+            if key != st.session_state.briefing_key:          # 새 파일 또는 새 날짜일 때만 분석
+                load_meeting(decode_text(raw), uploaded.name, meeting_date_input, key)
+                st.rerun()
+            elif st.session_state.show_uploader:
+                st.session_state.show_uploader = False
+                st.toast("이미 불러온 회의록이에요.")
+                st.rerun()
+        if has_meeting and not st.session_state.briefing:
+            st.markdown('<p class="aivle-hint">회의록은 기억하고 있지만 분석 결과가 없어요.</p>', unsafe_allow_html=True)
+            if st.button("다시 분석", key="btn_reanalyze"):
+                load_meeting(st.session_state.meeting_text, st.session_state.meeting_name, parse_iso(st.session_state.meeting_date) or today,
+                             st.session_state.briefing_key or ("retry",))
+                st.rerun()
+
+
+def render_assistant(ctx):
+    """페이지: AIVLE에게 부탁하기 — 회의록 카드 → 대화 카드(기록 → 예시 명령 → 작성기)"""
+    has_meeting = ctx["has_meeting"]
+    render_meeting_strip(ctx)
+    incoming, incoming_via = None, "text"
+    if st.session_state.prefill:                                  # 다른 페이지에서 넘어온 문장
+        incoming, st.session_state.prefill = st.session_state.prefill, None
+
+    with st.container(key="card_chat"):
+        # (1) 대화 기록 — 오래된 것부터, 최신이 아래 (자동 스크롤)
+        history_box = st.container(height=400, border=False, autoscroll=True)
+        with history_box:
+            msgs = st.session_state.messages
+            if not msgs:
+                st.markdown(f'<div class="aivle-msg-a"><span class="aivle-msg-label">{APP_NAME}</span><div class="aivle-bubble-a">'
+                            f'안녕하세요, {APP_NAME}이에요. 위에서 회의록을 올리면 요약하고 {USER_NAME}님 업무를 정리해 드릴게요. '
+                            '아래 마이크나 입력창으로 부탁해 주세요.</div></div>', unsafe_allow_html=True)
+            newest_id = msgs[-1]["id"] if msgs and msgs[-1]["role"] == "assistant" else None
+            for m in msgs:
                 render_message(m)
-                # 최신 답변에만 음성 플레이어 (처음 한 번만 자동 재생)
-                if m["role"] == "assistant" and idx == len(st.session_state.messages) - 1 and st.session_state.tts_audio:
+                if m["role"] == "assistant" and m.get("show_tasks") and st.session_state.tasks:
+                    render_task_links(m["id"])
+                if m["id"] == newest_id and st.session_state.tts_audio:          # 최신 답변에만 플레이어 (한 번만 자동 재생)
                     st.audio(st.session_state.tts_audio, format="audio/mp3", autoplay=st.session_state.tts_autoplay)
                     st.session_state.tts_autoplay = False
+        if not has_meeting and st.session_state.messages:
+            st.markdown('<p class="aivle-hint">회의 내용은 회의록이 있어야 답할 수 있어요 — 위 카드에서 파일을 올리거나 \'샘플 회의록으로 해보기\'를 눌러 주세요.</p>',
+                        unsafe_allow_html=True)
 
-        # 확인 대기 카드 (맨 앞 1건)
-        if st.session_state.pending_actions:
-            action = st.session_state.pending_actions[0]
-            args = action["args"]
-            aid = action["id"]
-            total = len(st.session_state.pending_actions)
-            counter = f" · 대기 1 / {total}" if total > 1 else ""
-            with st.container(key="able_card"):
-                if action["type"] == "email":
-                    st.markdown(f'<span class="able-label">MAIL — 보내기 전에 확인{counter}</span>', unsafe_allow_html=True)
-                    to = st.text_input("TO", value=args.get("to") or MY_EMAIL, key=f"w_to_{aid}")
-                    subject = st.text_input("RE", value=args.get("subject", ""), key=f"w_re_{aid}")
-                    body = st.text_area("BODY", value=args.get("body", ""), height=180, key=f"w_body_{aid}")
-                    k1, k2 = st.columns([1, 2])
-                    if k1.button("취소", key=f"w_cancel_{aid}"):
-                        cancel_action(action)
-                        st.rerun()
-                    if k2.button("보내기", key=f"w_send_{aid}", type="primary"):
-                        execute_email(action, to, subject, body)
-                        st.rerun()
-                else:
-                    st.markdown(f'<span class="able-label">CALENDAR — 등록 전에 확인{counter}</span>', unsafe_allow_html=True)
-                    title = st.text_input("TITLE", value=args.get("title", ""), key=f"w_title_{aid}")
-                    d = st.date_input("DATE", value=parse_iso(args.get("date")) or today, key=f"w_date_{aid}", format="YYYY-MM-DD")
-                    desc = st.text_area("NOTE", value=args.get("description", ""), height=100, key=f"w_desc_{aid}")
-                    k1, k2 = st.columns([1, 2])
-                    if k1.button("취소", key=f"w_cancel_{aid}"):
-                        cancel_action(action)
-                        st.rerun()
-                    if k2.button("등록", key=f"w_reg_{aid}", type="primary"):
-                        execute_calendar(action, title, d.isoformat(), desc)
-                        st.rerun()
-
-        # 빠른 실행
-        q1, q2, q3 = st.columns(3)
-        if q1.button("요약해줘", key="q_summary"):
-            incoming = "오늘 회의 내용을 요약해줘"
-        if q2.button("이번 주 일정", key="q_week"):
+        # (2) 예시 명령 (회의록이 필요한 것은 없으면 비활성)
+        q1, q2, q3, q4 = st.columns(4)
+        if q1.button("회의 요약 들려줘", key="chip_summary", disabled=not has_meeting):
+            incoming = "오늘 회의 내용을 요약해서 들려줘"
+        if q2.button("내 업무 메일로 보내줘", key="chip_mail", disabled=not has_meeting):
+            incoming = "회의 요약과 내 업무를 정리해서 내 메일로 보내줘"
+        if q3.button("업무 전부 캘린더에 넣어줘", key="chip_calendar", disabled=not has_meeting):
+            incoming = "내 업무를 전부 캘린더에 등록해줘"
+        if q4.button("이번 주 일정 알려줘", key="chip_week"):
             incoming = "이번 주 일정 알려줘"
-        if q3.button("업무를 캘린더에", key="q_calendar"):
-            incoming = "내 업무를 캘린더에 등록해줘"
+        if not has_meeting:
+            st.markdown('<p class="aivle-hint">회의록을 먼저 올려 주세요 — 지금은 일정 조회만 가능해요</p>', unsafe_allow_html=True)
 
-        # 텍스트 입력
+        # (3) 작성기: 마이크 + 텍스트
+        audio_value = st.audio_input("눌러서 말하기", key="mic", help="녹음 버튼을 누르고 말한 뒤 정지하면 바로 전송돼요.")
         with st.form("msg_form", clear_on_submit=True, border=False):
-            f1, f2 = st.columns([4, 1], vertical_alignment="bottom")
-            typed = f1.text_input("MESSAGE", placeholder="에이블에게 말하기", label_visibility="collapsed")
+            f1, f2 = st.columns([5, 1], vertical_alignment="bottom")
+            typed = f1.text_input("글로 부탁하기", placeholder=f"{APP_NAME}에게 글로 부탁하기 (예: 팀장님께 업무 정리 메일 보내줘)", label_visibility="collapsed")
             sent = f2.form_submit_button("보내기")
         if sent and typed.strip():
             incoming, incoming_via = typed, "text"
 
-        # 음성 입력 (같은 녹음은 한 번만 처리)
-        st.markdown('<span class="able-label">VOICE</span>', unsafe_allow_html=True)
-        audio_value = st.audio_input("음성으로 말하기", key="mic", label_visibility="collapsed")
-        if audio_value is not None:
+        pending_slot = st.empty()                                   # 처리 중 스피너 자리
+        if audio_value is not None:                                 # 같은 녹음은 한 번만
             audio_bytes = audio_value.getvalue()
             audio_hash = hashlib.md5(audio_bytes).hexdigest()
             if audio_hash != st.session_state.last_audio_hash:
                 st.session_state.last_audio_hash = audio_hash
                 if client is None:
-                    set_notice("error", "OPENAI_API_KEY 가 없어 음성을 인식할 수 없어요.")
+                    set_notice("note", "OPENAI_API_KEY 가 없어 음성을 인식할 수 없어요. (사이드바 '설정 안내' 참고)")
                 else:
                     try:
-                        with messages_box, st.spinner("듣고 있어요..."):
+                        with pending_slot.container(), st.spinner("음성을 글로 바꾸는 중…"):
                             heard = transcribe(audio_bytes)
                         if heard:
+                            st.toast(f"이렇게 들었어요: {heard[:40]}")
                             incoming, incoming_via = heard, "voice"
                         else:
-                            set_notice("warning", "음성을 알아듣지 못했어요. 다시 말씀해 주세요.")
+                            set_notice("warning", "음성을 알아듣지 못했어요. 조금 더 길게 말하고 다시 녹음해 주세요.")
                     except Exception as e:
-                        set_notice("error", f"음성 인식에 실패했어요: {e}")
+                        set_notice("error", f"음성 인식에 실패했어요: {e} — 다시 녹음해 주세요.")
 
-        # 하단: 워드마크 + history n / 10 + clear
-        z1, z2 = st.columns([2, 1], vertical_alignment="bottom")
-        z1.markdown('<span class="able-mark-sm">able.</span>', unsafe_allow_html=True)
-        z2.markdown(f'<div class="able-foot">history {count_turns(st.session_state.messages)} / {MAX_TURNS}</div>', unsafe_allow_html=True)
-        if z2.button("clear conversation", key="btn_clear"):
+        z1, z2 = st.columns([4, 1], vertical_alignment="center")
+        z1.markdown(f'<p class="aivle-hint">대화 기록 {count_turns(st.session_state.messages)} / {MAX_TURNS}턴 유지</p>', unsafe_allow_html=True)
+        if z2.button("대화 비우기", key="btn_clear"):
             st.session_state.messages = []
             st.session_state.pending_actions = []
             st.session_state.tts_audio = None
             st.session_state.tts_autoplay = False
+            st.toast("대화를 비웠어요.")
             st.rerun()
 
-        # 이번 rerun 에 들어온 발화 처리 (버튼 / 텍스트 / 음성 중 하나)
-        if incoming:
-            handle_user_message(incoming, incoming_via, messages_box)
+        if incoming:                                                # 버튼 / 텍스트 / 음성 / 다른 페이지에서 넘어온 문장
+            handle_user_message(incoming, incoming_via, pending_slot.container())
 
-# ---- 푸터 ----
-st.markdown('<div class="able-footer"><span>LISTEN · SUMMARIZE · SCHEDULE · SEND</span>'
-            '<span>KT AIVLE SCHOOL — MINI PROJECT 03</span></div>', unsafe_allow_html=True)
+
+def render_tasks(ctx):
+    """페이지: 내 업무 — 헤더 + [남은 업무 모두 캘린더에 추가] + 필터(추가 전/추가됨/완료) + 업무 카드"""
+    tasks = st.session_state.tasks
+    with st.container(key="page_tasks"):
+        if not ctx["has_meeting"] or not tasks:
+            with st.container(key="card_empty"):
+                st.markdown('<p class="aivle-h1">내 업무</p>', unsafe_allow_html=True)
+                if not ctx["has_meeting"]:
+                    st.markdown(f'<p class="aivle-hint">회의록을 올리면 {USER_NAME}님께 배정된 업무가 여기에 정리돼요.</p>', unsafe_allow_html=True)
+                else:
+                    st.markdown(f'<p class="aivle-hint">이 회의록에서는 {USER_NAME}님 업무를 찾지 못했어요. 다른 회의록을 올려 보세요.</p>', unsafe_allow_html=True)
+                if st.button(f"{PAGES['assistant']}로 가기", key="btn_go_assistant", type="primary"):
+                    go("assistant")
+            return
+
+        by_status = {"todo": [], "scheduled": [], "done": []}
+        for t in tasks:
+            by_status[task_status(t)].append(t)
+        h1, h2 = st.columns([3, 1.6], vertical_alignment="bottom")
+        h1.markdown(f'<p class="aivle-eyebrow">{esc(st.session_state.meeting_name)} · {fmt_kor_day(st.session_state.meeting_date)} 회의에서 배정</p>'
+                    f'<p class="aivle-h1">내 업무 <b>{len(tasks)}건</b></p>', unsafe_allow_html=True)
+        if by_status["todo"] and h2.button(f"남은 업무 모두 캘린더에 추가 ({len(by_status['todo'])}건)", key="btn_add_all", type="primary"):
+            for t in by_status["todo"]:
+                queue_task(t)
+            st.rerun()
+
+        # 필터
+        options = [f"전체 {len(tasks)}", f"캘린더 추가 전 {len(by_status['todo'])}", f"추가됨 {len(by_status['scheduled'])}", f"완료 {len(by_status['done'])}"]
+        choice = st.radio("보기", options, horizontal=True, label_visibility="collapsed", key="task_filter")
+        if choice.startswith("캘린더 추가 전"):
+            shown = by_status["todo"]
+        elif choice.startswith("추가됨"):
+            shown = by_status["scheduled"]
+        elif choice.startswith("완료"):
+            shown = by_status["done"]
+        else:
+            shown = list(tasks)
+
+        sel_id = st.session_state.selected_task                     # 대화에서 고른 업무를 맨 앞에
+        shown = sorted(shown, key=lambda t: 0 if t["id"] == sel_id else 1)
+        index_of = {t["id"]: i + 1 for i, t in enumerate(tasks)}
+        if not shown:
+            st.markdown('<p class="aivle-hint">이 조건에 맞는 업무가 없어요.</p>', unsafe_allow_html=True)
+
+        for t in shown:
+            selected = t["id"] == sel_id
+            status = task_status(t)
+            with st.container(key=(f"task_sel_{t['id']}" if selected else f"task_card_{t['id']}")):
+                tags = ""
+                if selected:
+                    tags += '<span class="aivle-tag">대화에서 선택한 업무</span>'
+                if t["id"] in st.session_state.drafts:
+                    tags += '<span class="aivle-tag aivle-tag-p">초안 있음</span>'
+                if status == "done":
+                    tags += '<span class="aivle-tag aivle-tag-ok">완료</span>'
+                if tags:
+                    st.markdown(tags, unsafe_allow_html=True)
+                c1, c2, c3 = st.columns([0.5, 3.4, 2.0], vertical_alignment="center")
+                c1.markdown(f'<span class="aivle-num">{index_of[t["id"]]}</span>', unsafe_allow_html=True)
+                due_html = (f'<span>{esc(task_due_label(t))}</span>' if t.get("due") else f'<span class="aivle-warn">{esc(task_due_label(t))}</span>')
+                c2.markdown(f'<p class="aivle-task-title">{esc(t["title"])}</p>'
+                            f'<p class="aivle-task-meta">{esc(t["detail"])} · 요청 {esc(t["requester"])} · {due_html}</p>', unsafe_allow_html=True)
+                with c3:
+                    if status == "todo":
+                        if st.button("캘린더에 추가", key=f"btn_add_{t['id']}", type="primary" if selected else "secondary"):
+                            queue_task(t)
+                            st.rerun()
+                    else:
+                        st.markdown(f'<span class="aivle-done">{"✓ 완료" if status == "done" else "✓ 캘린더에 추가됨"}</span>', unsafe_allow_html=True)
+                        if st.button("캘린더에서 보기 →", key=f"btn_seecal_{t['id']}"):
+                            d = parse_iso(t["due"]) or today
+                            go("calendar", cal_year=d.year, cal_month=d.month)
+                    if status != "done":
+                        if st.button("완료", key=f"btn_done_{t['id']}"):
+                            mark_task_done(t, True)
+                            st.toast(f"'{t['title']}' 완료로 표시했어요.")
+                            st.rerun()
+                    else:
+                        if st.button("완료 취소", key=f"btn_undone_{t['id']}"):
+                            mark_task_done(t, False)
+                            st.rerun()
+                    if st.button(f"{APP_NAME}에게 초안 맡기기" if t["id"] not in st.session_state.drafts else "초안 보기", key=f"btn_draft_{t['id']}"):
+                        st.session_state.draft_task = t["id"]
+                        st.rerun()
+                    if st.button("협업·미팅 요청", key=f"btn_req_{t['id']}"):
+                        open_request(task=t)
+                        st.rerun()
+                    if selected and st.button(f"{APP_NAME}에게 물어보기", key=f"btn_ask_{t['id']}"):
+                        go("assistant", prefill=f"{t['title']} 자세히 알려줘")
+
+
+def render_calendar(ctx):
+    """페이지: 캘린더 — 월 이동/새로고침 + 눌러서 여는 월간 그리드 + 다가오는 일정 + 보낸 요청"""
+    cal_y, cal_m = ctx["cal_y"], ctx["cal_m"]
+    is_owner = ctx["is_owner"]
+    with st.container(key="page_calendar"):
+        h1, n1, n2, n3, n4 = st.columns([3, 0.5, 0.5, 0.9, 1.0], vertical_alignment="bottom")
+        h1.markdown(f'<p class="aivle-eyebrow">{APP_NAME} 캘린더 · 모든 접속자가 같은 일정을 봐요 (앱 재시작 시 초기화)</p>'
+                    f'<p class="aivle-h1">캘린더 · {cal_y}년 {cal_m}월</p>', unsafe_allow_html=True)
+        if n1.button("‹", key="btn_prev"):
+            st.session_state.cal_year, st.session_state.cal_month = shift_month(cal_y, cal_m, -1)
+            st.rerun()
+        if n2.button("›", key="btn_next"):
+            st.session_state.cal_year, st.session_state.cal_month = shift_month(cal_y, cal_m, 1)
+            st.rerun()
+        if n3.button("오늘", key="btn_today"):
+            st.session_state.cal_year, st.session_state.cal_month = today.year, today.month
+            st.rerun()
+        if n4.button("새로고침", key="btn_refresh", type="primary"):
+            st.toast("캘린더를 다시 읽었어요.")
+            st.rerun()
+
+        g, u = st.columns([2.2, 1], gap="medium")
+        with g:
+            with st.container(key="card_calendar"):
+                st.markdown('<div class="aivle-legend">'
+                            f'<span><i style="background:#5B4BE0"></i>{APP_NAME}이 추가한 업무</span>'
+                            '<span><i style="background:#D1FAE5;border:1px solid #10B981"></i>캘린더의 다른 일정</span>'
+                            '<span><i style="background:#fff;border:1px dashed #5B4BE0"></i>요청 대기</span>'
+                            '<span><i style="background:#E2E8F0"></i>완료 / 거절</span></div>', unsafe_allow_html=True)
+                dows = st.columns(7)
+                for i, name in enumerate(WEEKDAY_KO):
+                    dows[i].markdown(f'<p class="aivle-dow">{name}</p>', unsafe_allow_html=True)
+                for week in build_month_cells(cal_y, cal_m, events_by_date(ctx["month_events"]), today.isoformat()):
+                    cols = st.columns(7)
+                    for i, cell in enumerate(week):
+                        if cell is None:
+                            continue
+                        with cols[i]:
+                            with st.container(key=(f"cellt_{cell['iso']}" if cell["is_today"] else f"cell_{cell['iso']}")):
+                                st.markdown(f'<span class="aivle-daynum">{cell["day"]}{" 오늘" if cell["is_today"] else ""}</span>', unsafe_allow_html=True)
+                                for ev in cell["chips"]:
+                                    if st.button(chip_label(ev), key=f"ev{chip_style(ev)}_{cell['iso']}_{ev['id']}", help=ev["title"]):
+                                        st.session_state.open_event = ev["id"]
+                                        st.rerun()
+                                if cell["more"]:
+                                    st.markdown(f'<span class="aivle-more">+{cell["more"]}</span>', unsafe_allow_html=True)
+        with u:
+            with st.container(key="card_upcoming"):
+                st.markdown('<p class="aivle-strong" style="font-size:18px">다가오는 일정</p><p class="aivle-hint">오늘부터 30일 · 눌러서 자세히</p>', unsafe_allow_html=True)
+                upcoming = [e for e in ctx["all_events"] if today.isoformat() <= e["date"] <= (today + timedelta(days=30)).isoformat()][:8]
+                if not upcoming:
+                    st.markdown('<p class="aivle-hint">다가오는 일정이 없어요.</p>', unsafe_allow_html=True)
+                for ev in upcoming:
+                    if st.button(f"{fmt_short(ev['date'])} · {chip_label(ev, 40)}" + (f" · {ev['start_time']}" if ev.get("start_time") else ""),
+                                 key=f"up_{ev['id']}"):
+                        st.session_state.open_event = ev["id"]
+                        st.rerun()
+                if is_owner and st.button("내 업무로 가기", key="btn_go_tasks"):
+                    go("tasks")
+
+            if is_owner:
+                sent_reqs = [e for e in ctx["all_events"] if e.get("kind") == "request" and e.get("from") == USER_NAME]
+                with st.container(key="card_sent"):
+                    st.markdown('<p class="aivle-strong" style="font-size:18px">보낸 요청</p>', unsafe_allow_html=True)
+                    if not sent_reqs:
+                        st.markdown('<p class="aivle-hint">아직 보낸 요청이 없어요. 일정이나 업무에서 \'협업·미팅 요청\'을 눌러 보세요.</p>', unsafe_allow_html=True)
+                    for ev in sent_reqs:
+                        tag = {"pending": "대기", "accepted": "확정", "rejected": "거절됨"}.get(ev.get("status"), "")
+                        if st.button(f"[{tag}] {ev.get('request_type')} · {ev.get('subject')} → {', '.join(ev.get('to') or [])} · {fmt_short(ev['date'])} {ev.get('start_time') or ''}",
+                                     key=f"sent_{ev['id']}"):
+                            st.session_state.open_event = ev["id"]
+                            st.rerun()
+
+
+def render_requests(ctx):
+    """페이지(팀원 보기 모드): 받은 요청 — 수락 / 거절(이유 필수)"""
+    me = st.session_state.view_as
+    mine = [e for e in ctx["all_events"] if e.get("kind") == "request" and me in (e.get("to") or [])]
+    pending = [e for e in mine if e.get("status") == "pending"]
+    decided = [e for e in mine if e.get("status") != "pending"]
+    focus = st.session_state.focus_request
+    pending = sorted(pending, key=lambda e: 0 if e["id"] == focus else 1)
+
+    st.markdown(f'<p class="aivle-eyebrow">{esc(me)} 화면 · {USER_NAME}가 보낸 요청</p><p class="aivle-h1">받은 요청 <b>{len(pending)}건</b></p>',
+                unsafe_allow_html=True)
+    if not pending:
+        with st.container(key="card_empty"):
+            st.markdown(f'<p class="aivle-hint">처리할 요청이 없어요. {USER_NAME} 화면에서 \'협업·미팅 요청\'을 보내면 여기에 나타나요.</p>', unsafe_allow_html=True)
+
+    for ev in pending:
+        with st.container(key=(f"req_focus_{ev['id']}" if ev["id"] == focus else f"req_{ev['id']}")):
+            if ev["id"] == focus:
+                st.markdown('<span class="aivle-tag aivle-tag-p">메일 링크로 열린 요청</span>', unsafe_allow_html=True)
+            st.markdown(f'<p class="aivle-task-title">{esc(ev.get("request_type"))} · {esc(ev.get("subject"))}</p>'
+                        f'<p class="aivle-task-meta">보낸 사람 {esc(ev.get("from"))} · {esc(fmt_when(ev))}</p>', unsafe_allow_html=True)
+            dlg_row("메시지", ev.get("message") or "")
+            if st.session_state.reject_for == ev["id"]:
+                reason = st.text_area("거절 이유 (필수)", key=f"reason_{ev['id']}", placeholder="예: 그 시간에 외부 미팅이 있어요. 금요일 오후는 어떨까요?")
+                c1, c2 = st.columns([1.4, 1])
+                if c1.button("거절 확정", key=f"btn_reject_ok_{ev['id']}", type="primary"):
+                    try:
+                        decide_request(ev, "rejected", me, reason)
+                        st.session_state.reject_for = None
+                        st.rerun()
+                    except ValueError as e:
+                        st.error(str(e))
+                if c2.button("돌아가기", key=f"btn_reject_back_{ev['id']}"):
+                    st.session_state.reject_for = None
+                    st.rerun()
+            else:
+                c1, c2 = st.columns([1.4, 1])
+                if c1.button("수락", key=f"btn_accept_{ev['id']}", type="primary"):
+                    decide_request(ev, "accepted", me)
+                    st.rerun()
+                if c2.button("거절", key=f"btn_reject_{ev['id']}"):
+                    st.session_state.reject_for = ev["id"]
+                    st.rerun()
+
+    if decided:
+        st.markdown('<p class="aivle-strong" style="margin-top:16px">처리한 요청</p>', unsafe_allow_html=True)
+        for ev in decided:
+            tag = "aivle-tag-ok" if ev.get("status") == "accepted" else "aivle-tag-x"
+            label = "확정" if ev.get("status") == "accepted" else "거절됨"
+            st.markdown(f'<p class="aivle-task-meta"><span class="aivle-tag {tag}">{label}</span>{esc(ev.get("request_type"))} · {esc(ev.get("subject"))} · {esc(fmt_when(ev))}'
+                        + (f' · 이유: {esc(ev.get("reason"))}' if ev.get("reason") else "") + "</p>", unsafe_allow_html=True)
+
+
+def handle_query_params():
+    """메일 링크 ?req=<id>&as=<이름> 로 열면 그 팀원 화면에서 해당 요청을 먼저 보여준다"""
+    if st.session_state.qp_handled:
+        return
+    st.session_state.qp_handled = True
+    try:
+        req, as_name = st.query_params.get("req"), st.query_params.get("as")
+    except Exception:
+        return
+    if req and as_name in TEAMMATES:
+        st.session_state.view_as = as_name
+        st.session_state.page = "requests"
+        st.session_state.focus_request = req
+
+
+def notify_status_changes(ctx):
+    """김 대리 화면: 보낸 요청의 상태가 바뀌었으면 토스트"""
+    seen = st.session_state.req_status_seen
+    for ev in ctx["all_events"]:
+        if ev.get("kind") != "request" or ev.get("from") != USER_NAME:
+            continue
+        prev = seen.get(ev["id"])
+        if prev is not None and prev != ev.get("status"):
+            verb = {"accepted": "수락", "rejected": "거절"}.get(ev.get("status"), "변경")
+            st.toast(f"{ev.get('decided_by') or '팀원'}님이 '{ev.get('subject')}' 요청을 {verb}했어요.")
+        seen[ev["id"]] = ev.get("status")
+
+
+def main():
+    handle_query_params()
+    restore_task_statuses()
+    ctx = build_context()
+    render_sidebar(ctx)
+    if ctx["is_owner"]:
+        notify_status_changes(ctx)
+    if not (st.session_state.pending_actions or st.session_state.request_form or st.session_state.draft_task or st.session_state.open_event):
+        render_notice()                               # 다이얼로그가 떠 있으면 안내는 그 안에서
+    page = st.session_state.page
+    if not ctx["is_owner"] and page not in ("requests", "calendar"):
+        page = st.session_state.page = "requests"
+    if page == "tasks":
+        render_tasks(ctx)
+    elif page == "calendar":
+        render_calendar(ctx)
+    elif page == "requests":
+        render_requests(ctx)
+    else:
+        render_assistant(ctx)
+    render_dialogs()
+
+
+main()
