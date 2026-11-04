@@ -424,6 +424,12 @@ header[data-testid="stHeader"]{background:transparent;}
 [class*="st-key-cell_"],[class*="st-key-cellt_"]{position:relative!important;padding:26px 6px 4px!important;}
 [class*="st-key-cell_"] [data-testid="stElementContainer"]:has(.aivle-daynum),[class*="st-key-cellt_"] [data-testid="stElementContainer"]:has(.aivle-daynum){position:absolute!important;top:5px;left:8px;width:auto!important;height:18px!important;margin:0!important;z-index:1;}
 [class*="st-key-cell_"] .aivle-daynum,[class*="st-key-cellt_"] .aivle-daynum{margin:0!important;line-height:18px!important;white-space:nowrap;}
+/* 녹음 직후: 재생 버튼은 숨기고 마이크(또는 처리 중 표시)만 가운데 */
+.st-key-mic_box button[aria-label="Play"],.st-key-mic_box button[aria-label="Pause"],
+.st-key-mic_box div:has(> button[aria-label="Play"]),.st-key-mic_box div:has(> button[aria-label="Pause"]){display:none!important;}
+.st-key-mic_box [data-testid="stAudioInput"]>div:not([data-testid="stWidgetLabel"])>div{justify-content:center!important;align-items:center!important;gap:0!important;}
+.st-key-mic_box [data-testid="stAudioInput"]>div:not([data-testid="stWidgetLabel"]) *{margin-left:0!important;margin-right:0!important;}
+.st-key-mic_box [data-testid="stAudioInput"] svg,.st-key-mic_box [data-testid="stAudioInput"] [data-testid="stIconMaterial"]{color:#fff!important;fill:currentColor;}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
