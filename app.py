@@ -578,6 +578,7 @@ def render_notice():
 def go(page, **updates):
     """페이지 이동 + 상태 갱신 후 rerun"""
     st.session_state.page = page
+    st.session_state.tts_autoplay = False                # 페이지를 옮기면 읽던 음성은 멈춤
     for k, v in updates.items():
         st.session_state[k] = v
     st.rerun()
@@ -1123,6 +1124,8 @@ def load_meeting(text, name, meeting_date, key):
     st.session_state.briefing, st.session_state.tasks = None, []
     st.session_state.selected_task = None
     st.session_state.drafts, st.session_state.draft_rev = {}, {}
+    st.session_state.summary_text, st.session_state.summary_key = None, None
+    st.session_state.summary_rev += 1
     st.session_state.show_uploader = False
     if client is None:
         set_notice("note", "OPENAI_API_KEY 가 없어 회의록 분석은 건너뛰었어요. 회의록 원문은 기억해 둘게요. (사이드바 '설정 안내' 참고)")
@@ -1298,7 +1301,7 @@ def build_system_prompt():
         f"이번 주 = {(today - timedelta(days=today.weekday())).isoformat()} ~ {(today + timedelta(days=6 - today.weekday())).isoformat()}, "
         f"다음 주 = {(today + timedelta(days=7 - today.weekday())).isoformat()} ~ {(today + timedelta(days=13 - today.weekday())).isoformat()}. "
         "날짜를 말할 때는 이 범위로 이번 주/다음 주를 판단하고, list_events 결과의 weekday 값을 그대로 씁니다. 일정을 물으면 범위를 이번 주와 다음 주까지 넉넉히 조회합니다.",
-        "회의록이 있으면 반드시 회의록 내용에 근거해 답하고, 회의록에 없는 내용은 추측하지 말고 없다고 말합니다. 회의록이 없으면 화면 위의 '회의록 파일 올리기'에서 파일을 올리거나 샘플 회의록을 써 보라고 한 문장으로 안내합니다.",
+        "회의록이 있으면 반드시 회의록 내용에 근거해 답하고, 회의록에 없는 내용은 추측하지 말고 없다고 말합니다. 회의록이 없으면 화면 위의 '회의록 파일(.txt) 올리기'에서 파일을 올려 달라고 한 문장으로 안내합니다.",
         f"팀 주소록: {address_book_text()}. '팀장님께 보내줘'처럼 이름으로 말하면 그 사람을 to 로 씁니다.",
         "도구 사용 규칙:",
         "- send_email: 사용자가 '메일로 보내줘', '이메일로 정리해줘'처럼 명시적으로 요청할 때만 호출합니다. 요약만 원하면 호출하지 않습니다. 수신자를 말하지 않으면 to 에 '김 대리' 를 넣습니다.",
@@ -1712,10 +1715,7 @@ def close_event():
 def event_dialog():
     ev = store_get(STORE, st.session_state.open_event)
     if not ev:
-        st.markdown('<p class="aivle-hint">일정을 찾을 수 없어요. </p>', unsafe_allow_html=True)
-        if st.button("닫기", key="ev_close_missing"):
-            close_event()
-            st.rerun()
+        st.markdown('<p class="aivle-hint">일정을 찾을 수 없어요.</p>', unsafe_allow_html=True)
         return
     render_notice()
     is_owner = st.session_state.view_as == USER_NAME
@@ -1739,35 +1739,37 @@ def event_dialog():
             dlg_row("상태", "✓ 완료")
         dlg_row("메모", ev.get("description") or "")
 
-    if is_owner:
-        cols = st.columns(3)
-        if not is_request:
-            if cols[0].button("협업·미팅 요청", key="ev_req", type="primary"):
-                open_request(task=task, event=ev)
-                close_event()
-                st.rerun()
-            if task and ev.get("source") == "able":
-                if ev.get("status") != "done" and cols[1].button("완료 표시", key="ev_done"):
-                    mark_task_done(task, True)
-                    close_event()
-                    st.toast("완료로 표시했어요.")
-                    st.rerun()
-                if cols[2].button("초안 맡기기", key="ev_draft"):
-                    st.session_state.draft_task = task["id"]
-                    close_event()
-                    st.rerun()
-        if st.button("닫기", key="ev_close"):
+    # 버튼은 오른쪽 끝, 주 버튼이 가장 오른쪽 (닫기는 오른쪽 위 X)
+    if is_owner and not is_request:
+        btns = [("ev_req", "협업·미팅 요청", "primary")]
+        if task and ev.get("source") == "able":
+            if ev.get("status") != "done":
+                btns.append(("ev_done", "완료 표시", "secondary"))
+            btns.append(("ev_draft", "초안 맡기기", "secondary"))
+        clicked = None
+        for slot, (key, label, kind) in zip(right_row(len(btns)), btns):
+            if slot.button(label, key=key, type=kind):
+                clicked = key
+        if clicked == "ev_req":
+            open_request(task=task, event=ev)
             close_event()
             st.rerun()
-    else:
+        elif clicked == "ev_done":
+            mark_task_done(task, True)
+            close_event()
+            st.toast("완료로 표시했어요.")
+            st.rerun()
+        elif clicked == "ev_draft":
+            st.session_state.draft_task = task["id"]
+            close_event()
+            st.rerun()
+    elif not is_owner:
         me = st.session_state.view_as
         if is_request and me in (ev.get("to") or []) and ev.get("status") == "pending":
-            if st.button("받은 요청에서 수락/거절하기", key="ev_go_requests", type="primary"):
+            slot = st.container(horizontal=True, horizontal_alignment="right")
+            if slot.button("수락/거절하러 가기", key="ev_go_requests", type="primary"):
                 close_event()
                 go("requests", focus_request=ev["id"])
-        if st.button("닫기", key="ev_close2"):
-            close_event()
-            st.rerun()
 
 
 def close_request():
@@ -2154,6 +2156,7 @@ def render_summary(ctx):
                     st.session_state.summary_text = ""
                     set_notice("error", f"요약에 실패했어요: {e} — '다시 요약'을 눌러 주세요.")
             st.session_state.summary_key = key
+            st.session_state.summary_rev += 1                    # 새 요약을 칸에 반영 (키가 같으면 예전 값 유지됨)
             render_notice()
 
         text = st.text_area("요약 (수정 가능)", value=st.session_state.summary_text or "", height=520,
@@ -2204,16 +2207,13 @@ def render_tasks(ctx):
             st.rerun()
 
         # 필터
-        options = [f"전체 {len(tasks)}", f"캘린더 추가 전 {len(by_status['todo'])}", f"추가됨 {len(by_status['scheduled'])}", f"완료 {len(by_status['done'])}"]
-        choice = st.radio("보기", options, horizontal=True, label_visibility="collapsed", key="task_filter")
-        if choice.startswith("캘린더 추가 전"):
-            shown = by_status["todo"]
-        elif choice.startswith("추가됨"):
-            shown = by_status["scheduled"]
-        elif choice.startswith("완료"):
-            shown = by_status["done"]
-        else:
-            shown = list(tasks)
+        counts = {"all": len(tasks), "todo": len(by_status["todo"]), "scheduled": len(by_status["scheduled"]), "done": len(by_status["done"])}
+        names = {"all": "전체", "todo": "캘린더 추가 전", "scheduled": "추가됨", "done": "완료"}
+        if st.session_state.get("task_filter") not in names:          # 예전 값(문자열 라벨)이 남아 있으면 초기화
+            st.session_state.pop("task_filter", None)
+        choice = st.radio("보기", list(names), format_func=lambda k: f"{names[k]} {counts[k]}", horizontal=True,
+                          label_visibility="collapsed", key="task_filter")
+        shown = list(tasks) if choice == "all" else by_status[choice]
 
         sel_id = st.session_state.selected_task                     # 대화에서 고른 업무를 맨 앞에
         shown = sorted(shown, key=lambda t: 0 if t["id"] == sel_id else 1)
