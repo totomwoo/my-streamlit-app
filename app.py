@@ -424,12 +424,6 @@ header[data-testid="stHeader"]{background:transparent;}
 [class*="st-key-cell_"],[class*="st-key-cellt_"]{position:relative!important;padding:26px 6px 4px!important;}
 [class*="st-key-cell_"] [data-testid="stElementContainer"]:has(.aivle-daynum),[class*="st-key-cellt_"] [data-testid="stElementContainer"]:has(.aivle-daynum){position:absolute!important;top:5px;left:8px;width:auto!important;height:18px!important;margin:0!important;z-index:1;}
 [class*="st-key-cell_"] .aivle-daynum,[class*="st-key-cellt_"] .aivle-daynum{margin:0!important;line-height:18px!important;white-space:nowrap;}
-/* 녹음 직후: 재생 버튼은 숨기고 마이크(또는 처리 중 표시)만 가운데 */
-.st-key-mic_box button[aria-label="Play"],.st-key-mic_box button[aria-label="Pause"],
-.st-key-mic_box div:has(> button[aria-label="Play"]),.st-key-mic_box div:has(> button[aria-label="Pause"]){display:none!important;}
-.st-key-mic_box [data-testid="stAudioInput"]>div:not([data-testid="stWidgetLabel"])>div{justify-content:center!important;align-items:center!important;gap:0!important;}
-.st-key-mic_box [data-testid="stAudioInput"]>div:not([data-testid="stWidgetLabel"]) *{margin-left:0!important;margin-right:0!important;}
-.st-key-mic_box [data-testid="stAudioInput"] svg,.st-key-mic_box [data-testid="stAudioInput"] [data-testid="stIconMaterial"]{color:#fff!important;fill:currentColor;}
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -1971,6 +1965,67 @@ def render_sidebar(ctx):
             if st.button(PAGES["calendar"], key="nav_calendar", icon=":material/calendar_month:", type="primary" if page == "calendar" else "secondary"):
                 go("calendar")
 
+        # TEAM_CSV_EXTENSION_START — 추가 메뉴 (팀원 원본 로직 변경 없음)
+        if is_owner:
+            from custom_task_addon import init_custom_tasks
+            init_custom_tasks()
+            st.session_state.setdefault("hidden_extra_pages", [])
+            st.markdown("""<style>
+            [class*="st-key-xnav_"]{position:relative;}
+            [class*="st-key-xdel_"]{position:absolute!important;top:2px;right:4px;width:auto!important;z-index:5;}
+            [class*="st-key-xdel_"] button{min-height:0!important;height:18px!important;width:18px!important;padding:0!important;
+              border:none!important;background:transparent!important;box-shadow:none!important;color:#64748b!important;opacity:.35;}
+            [class*="st-key-xdel_"] button p{font-size:12px!important;line-height:1!important;}
+            [class*="st-key-xdel_"] button:hover{opacity:.9;}
+            [class*="st-key-xnav_"]:has(button[kind="primary"]) [class*="st-key-xdel_"] button{color:#fff!important;opacity:.55;}
+            </style>""", unsafe_allow_html=True)
+            with st.expander("마케팅 · CSV 분석 (추가 기능)", expanded=True):
+                extra_pages = [
+                    ("CSV 시각화 보고서", "csv_report"),
+                    ("마케팅 통합 대시보드", "m_dashboard"),
+                    ("경쟁사 마케팅 분석", "m_competitor"),
+                    ("SNS 콘텐츠 작성", "m_sns"),
+                    ("인플루언서 조사", "m_influencer"),
+                    ("마케팅 업무 기록", "m_history"),
+                ]
+                hidden = st.session_state.hidden_extra_pages
+                # 기본 추가 기능: × 누르면 메뉴에서 숨김
+                for label, target in extra_pages:
+                    if target in hidden:
+                        continue
+                    with st.container(key=f"xnav_{target}"):
+                        if st.button(label, key=f"extra_nav_{target}", type="primary" if page == target else "secondary", use_container_width=True):
+                            go(target)
+                        if st.button("×", key=f"xdel_{target}", help=f"{label} 메뉴에서 숨기기"):
+                            hidden.append(target)
+                            if page == target:
+                                go("summary")
+                            st.rerun()
+                # LLM으로 추가한 기능: × 누르면 삭제
+                for item in list(st.session_state.custom_task_templates):
+                    with st.container(key="xnav_c_" + item["id"]):
+                        if st.button(
+                            item["title"],
+                            key="custom_nav_" + item["id"],
+                            type="primary" if page == "custom_run" and st.session_state.get("custom_task_active_id") == item["id"] else "secondary",
+                            use_container_width=True,
+                        ):
+                            go("custom_run", custom_task_active_id=item["id"])
+                        if st.button("×", key="xdel_c_" + item["id"], help=f"{item['title']} 기능 삭제"):
+                            from custom_task_addon import remove_custom_task
+                            if remove_custom_task(item["id"]):
+                                st.toast(f"{item['title']} 기능을 삭제했습니다.")
+                            st.rerun()
+                if hidden:
+                    if st.button(f"숨긴 기능 {len(hidden)}개 다시 보기", key="extra_restore", use_container_width=True):
+                        hidden.clear()
+                        st.rerun()
+                st.divider()
+                if st.button("＋ 추가하기", key="custom_nav_create", type="primary", use_container_width=True):
+                    go("custom_create")
+                st.caption("✨ 맡은 업무를 입력하면 LLM이 맞춤형 기능 틀을 만들어 줍니다.")
+        # TEAM_CSV_EXTENSION_END
+
         # 데이터 초기화 (확인 후 실행)
         st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
         if not st.session_state.confirm_reset:
@@ -2448,7 +2503,21 @@ def main():
     page = st.session_state.page
     if not ctx["is_owner"] and page not in ("requests", "calendar"):
         page = st.session_state.page = "requests"
-    if page == "summary":
+    # TEAM_CSV_EXTENSION_ROUTE_START — 확장 페이지
+    if page == "csv_report":
+        from csv_report_addon import render_csv_report
+        render_csv_report()
+    elif page in ("m_dashboard", "m_competitor", "m_sns", "m_influencer", "m_history"):
+        from marketing_addon import render_marketing_page
+        render_marketing_page(page)
+    elif page == "custom_create":
+        from custom_task_addon import render_custom_task_creator
+        render_custom_task_creator()
+    elif page == "custom_run":
+        from custom_task_addon import render_custom_task_runner
+        render_custom_task_runner()
+    # TEAM_CSV_EXTENSION_ROUTE_END
+    elif page == "summary":
         render_summary(ctx)
     elif page == "tasks":
         render_tasks(ctx)
