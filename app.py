@@ -17,7 +17,7 @@
 #   - '메일 보내기' 확인 창에서 입력한 주소로 실제 발송합니다. 협업·미팅 요청 알림은 팀원 주소가 가상이라 MY_EMAIL 로 보냅니다.
 # =========================================================
 
-import os, re, json, html, hashlib, uuid, smtplib, threading, base64
+import os, re, json, html, hashlib, uuid, smtplib, threading, base64, wave
 import calendar as cal_lib
 from datetime import date, datetime, time, timedelta, timezone
 from email.mime.application import MIMEApplication
@@ -45,10 +45,29 @@ from openai import OpenAI
 st.set_page_config(page_title="AIVLE — 김 대리의 AI 비서", page_icon="◆", layout="wide", initial_sidebar_state="expanded")
 
 APP_NAME = "AIVLE"
+LOGO_SVG = (
+    '<svg class="aivle-logo" width="40" height="40" viewBox="0 0 40 40" aria-hidden="true">'
+    '<rect width="40" height="40" rx="11" fill="#1E1B4B"/>'
+    '<path d="M12.5 29 L20 11 L27.5 29" fill="none" stroke="#fff" stroke-width="3.4" '
+    'stroke-linecap="round" stroke-linejoin="round"/>'
+    '<circle cx="20" cy="24" r="2.7" fill="#8F80FF"/></svg>'
+)
 USER_NAME = "김 대리"
 KST = timezone(timedelta(hours=9))          # 한국 시간 (서머타임 없음)
 LLM_MODEL = "gpt-4o-mini"
-STT_MODEL = "whisper-1"
+STT_MODEL = "gpt-4o-mini-transcribe"        # 한국어 인식이 더 정확한 모델 (쓸 수 없으면 아래 모델로 자동 전환)
+STT_FALLBACK_MODEL = "whisper-1"
+# 음성 인식 힌트: 김 대리가 자주 말할 단어·문장. 이름과 업무 용어를 비슷한 다른 말로 잘못 받아 적는 것을 줄인다
+STT_PROMPT = ("에이블(AIVLE), 김 대리입니다. 회의록 요약해 줘. 회의 내용 정리해 줘. 내 업무 알려 줘. "
+              "나한테 배정된 업무 3가지, 업무 목록, 마감일, 우선순위. 업무 전부 캘린더에 넣어 줘. 일정 추가, 일정 등록, "
+              "이번 주 일정, 다음 주 일정, 오늘 일정. 메일로 보내 줘, 내 메일, 이메일 발송. "
+              "팀장님, 박과장님, 이과장님, 최대리님. 협업·미팅 요청, 초안 작성, 완료 표시. "
+              "경쟁사 마케팅 분석, SNS 콘텐츠 작성, 인플루언서 조사, CSV 시각화 보고서, 사전예약, 광고 성과.")
+STT_MIN_SECONDS = 0.6                         # 이보다 짧은 녹음은 인식하지 않음 (잘못 누른 경우)
+# 무음·잡음일 때 음성 인식 모델이 지어내는 것으로 알려진 문장 (공백 제거 후 비교)
+STT_HALLUCINATIONS = ("시청해주셔서감사합니다", "시청해주셔서고맙습니다", "구독과좋아요", "좋아요와구독", "구독좋아요",
+                      "다음영상에서만나요", "자막제공", "자막by", "mbc뉴스", "kbs뉴스", "sbs뉴스", "이덕영입니다",
+                      "thankyouforwatching", "pleasesubscribe")
 TTS_MODEL = "gpt-4o-mini-tts"               # 실패하면 tts-1 로 재시도
 TTS_VOICE = "alloy"
 MAX_TURNS = 10                              # 대화 기록 유지 턴 수
@@ -235,8 +254,8 @@ header[data-testid="stHeader"]{background:transparent;}
 [data-testid="stSidebar"] .st-key-btn_reset button,[data-testid="stSidebar"] .st-key-btn_reset_yes button,[data-testid="stSidebar"] .st-key-btn_reset_no button{min-height:34px;font-size:12px;color:var(--muted);justify-content:center;border:1px solid var(--border);}
 [data-testid="stSidebar"] .st-key-btn_reset_yes button{color:#B91C1C;border-color:#FCA5A5;}
 .aivle-brand{display:flex;align-items:center;gap:10px;padding:4px 8px 12px;}
-.aivle-brand i{width:40px;height:40px;border-radius:12px;background:var(--primary);display:inline-flex;align-items:center;justify-content:center;color:#fff;font-style:normal;font-weight:700;}
-.aivle-wordmark{font-size:22px;font-weight:700;color:var(--text);}
+.aivle-brand .aivle-logo{width:40px;height:40px;flex:none;display:block;}
+.aivle-wordmark{font-size:22px;font-weight:700;color:var(--text);letter-spacing:.06em;}
 .aivle-conn{display:flex;flex-direction:column;gap:8px;padding:12px;border-radius:14px;background:#fff;font-size:13px;color:var(--text2);}
 .aivle-conn span{display:inline-flex;align-items:center;gap:6px;}
 .aivle-conn i{width:8px;height:8px;border-radius:50%;display:inline-block;flex:0 0 8px;}
@@ -394,6 +413,13 @@ header[data-testid="stHeader"]{background:transparent;}
 .st-key-mic_box [data-testid="stAudioInputActionButton"]{width:52px!important;height:52px!important;color:#fff!important;border-radius:999px!important;}
 .st-key-mic_box [data-testid="stAudioInputActionButton"] *{color:#fff!important;}
 .st-key-mic_box [data-testid="stAudioInputActionButton"] svg{width:24px;height:24px;}
+/* 녹음을 멈춘 뒤 처리될 때까지 잠깐 나타나던 재생/초기화 버튼(흰 글자 깨짐)을 숨기고, 대신 동그라미 안에 로딩 표시 */
+.st-key-mic_box [data-testid="stAudioInputActionButton"][aria-label="Play"],
+.st-key-mic_box [data-testid="stAudioInputActionButton"][aria-label="Pause"],
+.st-key-mic_box [data-testid="stAudioInputActionButton"][aria-label="Reset"]{display:none!important;}
+.st-key-mic_box [data-testid="stAudioInput"]:has([aria-label="Play"],[aria-label="Pause"])>div:not([data-testid="stWidgetLabel"]){position:relative;}
+.st-key-mic_box [data-testid="stAudioInput"]:has([aria-label="Play"],[aria-label="Pause"])>div:not([data-testid="stWidgetLabel"])::after{content:"";position:absolute;left:50%;top:50%;width:20px;height:20px;margin:-10px 0 0 -10px;border-radius:50%;border:2.5px solid rgba(255,255,255,.4);border-top-color:#fff;animation:aivleMicSpin .8s linear infinite;}
+@keyframes aivleMicSpin{to{transform:rotate(360deg);}}
 .st-key-card_chat [data-testid="stHorizontalBlock"]:has(.st-key-mic_box){align-items:center!important;}
 .st-key-card_chat .stFormSubmitButton,.st-key-card_chat [data-testid="stElementContainer"]:has(.stFormSubmitButton){width:100%!important;}
 .st-key-card_chat .stFormSubmitButton>button{width:100%!important;min-height:52px;border-radius:999px;}
@@ -474,6 +500,15 @@ def store_update(store, event_id, **fields):
         ev.update(fields)
         store["version"] += 1
         return True
+
+
+def store_delete(store, event_id):
+    """일정 1건 삭제 → 지웠으면 True"""
+    with store["lock"]:
+        removed = store["events"].pop(event_id, None)
+        if removed is not None:
+            store["version"] += 1
+        return removed is not None
 
 
 def store_get(store, event_id):
@@ -903,6 +938,22 @@ def find_task(task_id):
         if t["id"] == task_id:
             return t
     return None
+
+
+def delete_task(task_id):
+    """'내 업무'에서 업무 하나를 지운다. 이 업무에 묶인 초안·선택 상태·확인 대기 작업도 함께 정리한다.
+    이미 캘린더에 추가된 일정은 그대로 둔다 (캘린더에서 따로 관리)"""
+    task = find_task(task_id)
+    if task is None:
+        return None
+    st.session_state.tasks = [t for t in st.session_state.tasks if t["id"] != task_id]
+    st.session_state.drafts.pop(task_id, None)
+    if st.session_state.selected_task == task_id:
+        st.session_state.selected_task = None
+    if st.session_state.draft_task == task_id:
+        st.session_state.draft_task = None
+    st.session_state.pending_actions = [a for a in st.session_state.pending_actions if a.get("task_id") != task_id]
+    return task
 
 
 def match_task_by_title(title):
@@ -1384,11 +1435,50 @@ def run_able(assistant_msg_id):
 
 
 # ---- (d) STT / TTS ----
+def audio_seconds(audio_bytes):
+    """WAV 녹음 길이(초). 길이를 알 수 없으면 None"""
+    try:
+        with wave.open(BytesIO(audio_bytes)) as w:
+            return w.getnframes() / float(w.getframerate() or 1)
+    except Exception:
+        return None
+
+
+def looks_like_noise(text):
+    """무음·잡음에서 나온 엉뚱한 결과인지 판단 → True 면 실행하지 않는다"""
+    norm = re.sub(r"[\s\W_]+", "", text or "").lower()
+    if len(norm) < 2 or not re.search(r"[가-힣a-z0-9]", norm):
+        return True                                      # 글자가 거의 없음 (예: '...', '음')
+    if any(h in norm for h in STT_HALLUCINATIONS) and len(norm) <= 40:
+        return True                                      # 영상 끝인사·자막 같은 지어낸 문장
+    prompt_norm = re.sub(r"[\s\W_]+", "", STT_PROMPT).lower()
+    if len(norm) >= 30 and norm in prompt_norm:
+        return True                                      # 힌트 문장 여러 개를 그대로 이어 쓴 경우 (짧은 명령은 통과)
+    return False
+
+
 def transcribe(audio_bytes):
-    """음성 → 텍스트 (whisper-1)"""
-    transcript = client.audio.transcriptions.create(
-        model=STT_MODEL, file=("audio.wav", audio_bytes, "audio/wav"), language="ko")
-    return transcript.text.strip()
+    """음성 → 텍스트. gpt-4o-mini-transcribe 를 먼저 쓰고, 쓸 수 없으면 whisper-1 로 전환.
+    너무 짧은 녹음이나 엉뚱한 결과는 빈 문자열을 돌려준다 (호출부에서 '다시 말해 달라'고 안내)"""
+    secs = audio_seconds(audio_bytes)
+    if secs is not None and secs < STT_MIN_SECONDS:
+        return ""
+    models = [STT_MODEL, STT_FALLBACK_MODEL]
+    if st.session_state.get("stt_model_unavailable"):
+        models = [STT_FALLBACK_MODEL]
+    last_err = None
+    for model in models:
+        try:
+            transcript = client.audio.transcriptions.create(
+                model=model, file=("audio.wav", audio_bytes, "audio/wav"), language="ko",
+                prompt=STT_PROMPT, temperature=0)
+            text = (transcript.text or "").strip()
+            return "" if looks_like_noise(text) else text
+        except Exception as e:                           # 모델 권한·이름 문제면 다음 모델로
+            last_err = e
+            if model == STT_MODEL:
+                st.session_state.stt_model_unavailable = True
+    raise last_err
 
 
 def speak(text):
@@ -1780,6 +1870,33 @@ def event_dialog():
             st.session_state.draft_task = task["id"]
             close_event()
             st.rerun()
+
+        # 하단 삭제 버튼 (한 번 더 확인한 뒤 삭제)
+        st.html("""<style>
+        .st-key-ev_delete button,.st-key-ev_delete_yes button{color:#B91C1C!important;border-color:#FCA5A5!important;background:#fff!important;}
+        .st-key-ev_delete button:hover,.st-key-ev_delete_yes button:hover{background:#FEF2F2!important;}
+        .st-key-ev_delete_yes button{background:#DC2626!important;color:#fff!important;border-color:#DC2626!important;}
+        </style>""")
+        st.markdown('<div style="height:6px"></div>', unsafe_allow_html=True)
+        if st.session_state.get("confirm_delete_event") != ev["id"]:
+            if st.button("일정 삭제", key="ev_delete", icon=":material/delete:"):
+                st.session_state.confirm_delete_event = ev["id"]
+                st.rerun()
+        else:
+            st.markdown('<p class="aivle-hint">이 일정을 캘린더에서 삭제할까요? 삭제하면 되돌릴 수 없어요.</p>', unsafe_allow_html=True)
+            c_no, c_yes, _ = st.columns([1, 1, 3], gap="small")
+            if c_no.button("취소", key="ev_delete_no", width="stretch"):
+                st.session_state.confirm_delete_event = None
+                st.rerun()
+            if c_yes.button("삭제", key="ev_delete_yes", width="stretch"):
+                st.session_state.confirm_delete_event = None
+                store_delete(STORE, ev["id"])
+                for t in st.session_state.tasks:            # 이 일정과 연결된 업무는 '캘린더 추가 전'으로 되돌림
+                    if t.get("event_id") == ev["id"]:
+                        t["event_id"], t["done"] = None, False
+                close_event()
+                st.toast(f"'{ev['title']}' 일정을 삭제했어요.")
+                st.rerun()
     elif not is_owner:
         me = st.session_state.view_as
         if is_request and me in (ev.get("to") or []) and ev.get("status") == "pending":
@@ -1882,7 +1999,10 @@ def render_dialogs():
     """우선순위: 확인 대기(캘린더/메일) → 요청 작성 → 초안 → 일정 보기"""
     action_now = current_action()
     if action_now:
-        calendar_dialog() if action_now["type"] == "calendar" else email_dialog()
+        if action_now["type"] == "calendar":
+            calendar_dialog()
+        else:
+            email_dialog()
     elif st.session_state.request_form:
         request_dialog()
     elif st.session_state.draft_task:
@@ -1946,7 +2066,7 @@ def render_task_links(msg_id):
 def render_sidebar(ctx):
     """사이드바: 브랜드, 보기 모드, 메뉴, 단계, 연결 상태, 설정 안내, 데모 초기화"""
     with st.sidebar:
-        st.markdown(f'<div class="aivle-brand"><i>A</i><span class="aivle-wordmark">{APP_NAME}</span></div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="aivle-brand">{LOGO_SVG}<span class="aivle-wordmark">{APP_NAME}</span></div>', unsafe_allow_html=True)
 
         # 보기 모드 (시연: 팀원 화면으로 전환)
         names = [USER_NAME] + TEAMMATES
@@ -2226,7 +2346,7 @@ def render_assistant(ctx):
                             st.toast(f"이렇게 들었어요: {heard[:40]}")
                             incoming, incoming_via = heard, "voice"
                         else:
-                            set_notice("warning", "음성을 알아듣지 못했어요. 조금 더 길게 말하고 다시 녹음해 주세요.")
+                            set_notice("warning", "음성을 알아듣지 못했어요. 마이크를 누르고 잠깐 뒤에 또박또박 말한 다음, 다시 눌러 주세요.")
                     except Exception as e:
                         set_notice("error", f"음성 인식에 실패했어요: {e} — 다시 녹음해 주세요.")
 
@@ -2313,10 +2433,16 @@ def render_tasks(ctx):
         # 필터
         counts = {"all": len(tasks), "todo": len(by_status["todo"]), "scheduled": len(by_status["scheduled"]), "done": len(by_status["done"])}
         names = {"all": "전체", "todo": "캘린더 추가 전", "scheduled": "추가됨", "done": "완료"}
-        if st.session_state.get("task_filter") not in names:          # 예전 값(문자열 라벨)이 남아 있으면 초기화
-            st.session_state.pop("task_filter", None)
-        choice = st.radio("보기", list(names), format_func=lambda k: f"{names[k]} {counts[k]}", horizontal=True,
-                          label_visibility="collapsed", key="task_filter")
+        # 개수가 바뀌면(삭제·완료 등) 라벨이 달라져 선택 표시가 사라지는 문제 방지:
+        # 고른 필터는 따로 저장하고, 개수가 바뀔 때마다 그 값을 기본 선택으로 다시 그린다
+        sel = st.session_state.get("task_filter_sel", "all")
+        if sel not in names:
+            sel = "all"
+        sig = "_".join(str(counts[k]) for k in names)
+        choice = st.radio("보기", list(names), index=list(names).index(sel),
+                          format_func=lambda k: f"{names[k]} {counts[k]}", horizontal=True,
+                          label_visibility="collapsed", key=f"task_filter_{sig}")
+        st.session_state.task_filter_sel = choice
         shown = list(tasks) if choice == "all" else by_status[choice]
 
         sel_id = st.session_state.selected_task                     # 대화에서 고른 업무를 맨 앞에
@@ -2325,10 +2451,25 @@ def render_tasks(ctx):
         if not shown:
             st.markdown('<p class="aivle-hint">이 조건에 맞는 업무가 없어요.</p>', unsafe_allow_html=True)
 
+        # 업무 카드 오른쪽 위의 연한 × (삭제) 버튼 스타일
+        st.html("""<style>
+        [class*="st-key-task_card_"],[class*="st-key-task_sel_"]{position:relative;padding-right:52px!important;}
+        [class*="st-key-tdel_"]{position:absolute!important;top:14px;right:14px;width:auto!important;z-index:5;}
+        [class*="st-key-tdel_"] button{min-height:0!important;height:24px!important;width:24px!important;padding:0!important;
+          border:none!important;border-radius:8px!important;background:transparent!important;box-shadow:none!important;
+          color:#64748b!important;opacity:.4;justify-content:center!important;}
+        [class*="st-key-tdel_"] button p{font-size:15px!important;line-height:1!important;}
+        [class*="st-key-tdel_"] button:hover{opacity:1;color:#B91C1C!important;background:#FEF2F2!important;}
+        </style>""")
         for t in shown:
             selected = t["id"] == sel_id
             status = task_status(t)
             with st.container(key=(f"task_sel_{t['id']}" if selected else f"task_card_{t['id']}")):
+                if st.button("×", key=f"tdel_{t['id']}", help="이 업무 삭제"):
+                    removed = delete_task(t["id"])
+                    if removed:
+                        st.toast(f"'{removed['title']}' 업무를 삭제했어요.")
+                    st.rerun()
                 tags = ""
                 if selected:
                     tags += '<span class="aivle-tag">대화에서 선택한 업무</span>'
@@ -2458,6 +2599,7 @@ def render_requests(ctx):
 
     st.markdown(f'<p class="aivle-eyebrow">{esc(me)} 화면 · {USER_NAME}가 보낸 요청</p><p class="aivle-h1">받은 요청 <b>{len(pending)}건</b></p>',
                 unsafe_allow_html=True)
+    st.markdown('<div style="height:10px"></div>', unsafe_allow_html=True)      # 제목과 요청 카드 사이 간격
     if not pending:
         with st.container(key="card_empty"):
             st.markdown(f'<p class="aivle-hint">처리할 요청이 없어요. {USER_NAME} 화면에서 \'협업·미팅 요청\'을 보내면 여기에 나타나요.</p>', unsafe_allow_html=True)
@@ -2471,7 +2613,9 @@ def render_requests(ctx):
             dlg_row("메시지", ev.get("message") or "")
             if st.session_state.reject_for == ev["id"]:
                 reason = st.text_area("거절 이유 (필수)", key=f"reason_{ev['id']}", placeholder="예: 그 시간에 외부 미팅이 있어요. 금요일 오후는 어떨까요?")
-                c1, c2 = right_row(2)
+                row = st.container(horizontal=True, horizontal_alignment="right", gap="small")
+                c2, c1 = row, row
+                back_clicked = c2.button("돌아가기", key=f"btn_reject_back_{ev['id']}")
                 if c1.button("거절 확정", key=f"btn_reject_ok_{ev['id']}", type="primary"):
                     try:
                         decide_request(ev, "rejected", me, reason)
@@ -2479,15 +2623,16 @@ def render_requests(ctx):
                         st.rerun()
                     except ValueError as e:
                         st.error(str(e))
-                if c2.button("돌아가기", key=f"btn_reject_back_{ev['id']}"):
+                if back_clicked:
                     st.session_state.reject_for = None
                     st.rerun()
             else:
-                c1, c2 = right_row(2)
-                if c1.button("수락", key=f"btn_accept_{ev['id']}", type="primary"):
+                row = st.container(horizontal=True, horizontal_alignment="right", gap="small")
+                reject_clicked = row.button("거절", key=f"btn_reject_{ev['id']}")
+                if row.button("수락", key=f"btn_accept_{ev['id']}", type="primary"):
                     decide_request(ev, "accepted", me)
                     st.rerun()
-                if c2.button("거절", key=f"btn_reject_{ev['id']}"):
+                if reject_clicked:
                     st.session_state.reject_for = ev["id"]
                     st.rerun()
 
