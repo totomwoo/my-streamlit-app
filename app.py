@@ -1976,63 +1976,91 @@ def render_sidebar(ctx):
             if st.button(PAGES["calendar"], key="nav_calendar", icon=":material/calendar_month:", type="primary" if page == "calendar" else "secondary"):
                 go("calendar")
 
-        # TEAM_CSV_EXTENSION_START — 추가 메뉴 (팀원 원본 로직 변경 없음)
+        # TEAM_CSV_EXTENSION_START — 업무용 툴 (위 메뉴와 같은 버튼 + 아코디언)
         if is_owner:
             init_custom_tasks()                      # 8) 추가 기능
             st.session_state.setdefault("hidden_extra_pages", [])
-            st.markdown("""<style>
-            [class*="st-key-xnav_"]{position:relative;}
-            [class*="st-key-xdel_"]{position:absolute!important;top:2px;right:4px;width:auto!important;z-index:5;}
-            [class*="st-key-xdel_"] button{min-height:0!important;height:18px!important;width:18px!important;padding:0!important;
-              border:none!important;background:transparent!important;box-shadow:none!important;color:#64748b!important;opacity:.35;}
-            [class*="st-key-xdel_"] button p{font-size:12px!important;line-height:1!important;}
-            [class*="st-key-xdel_"] button:hover{opacity:.9;}
-            [class*="st-key-xnav_"]:has(button[kind="primary"]) [class*="st-key-xdel_"] button{color:#fff!important;opacity:.55;}
-            </style>""", unsafe_allow_html=True)
-            with st.expander("마케팅 · CSV 분석 (추가 기능)", expanded=True):
-                extra_pages = [
-                    ("CSV 시각화 보고서", "csv_report"),
-                    ("마케팅 통합 대시보드", "m_dashboard"),
-                    ("경쟁사 마케팅 분석", "m_competitor"),
-                    ("SNS 콘텐츠 작성", "m_sns"),
-                    ("인플루언서 조사", "m_influencer"),
-                    ("마케팅 업무 기록", "m_history"),
-                ]
-                hidden = st.session_state.hidden_extra_pages
-                # 기본 추가 기능: × 누르면 메뉴에서 숨김
-                for label, target in extra_pages:
-                    if target in hidden:
-                        continue
-                    with st.container(key=f"xnav_{target}"):
-                        if st.button(label, key=f"extra_nav_{target}", type="primary" if page == target else "secondary", use_container_width=True):
-                            go(target)
-                        if st.button("×", key=f"xdel_{target}", help=f"{label} 메뉴에서 숨기기"):
-                            hidden.append(target)
-                            if page == target:
-                                go("summary")
+            tool_pages = {"csv_report", "m_dashboard", "m_competitor", "m_sns", "m_influencer", "m_history",
+                          "custom_create", "custom_run"}
+            # 사용자가 직접 열고 닫은 상태가 있으면 그대로, 없으면 업무용 툴 페이지를 보고 있을 때만 펼침
+            tools_choice = st.session_state.get("tools_open")
+            tools_open = tools_choice if tools_choice is not None else page in tool_pages
+            st.html("""<style>
+            [data-testid="stSidebar"] [class*="st-key-nav_tools"] [data-testid="stIconMaterial"]{color:var(--primary);}
+            [data-testid="stSidebar"] [class*="st-key-nav_tools"] button::after{content:"";flex:0 0 auto;margin-left:auto;margin-right:4px;
+              width:7px;height:7px;border-right:2px solid #94a3b8;border-bottom:2px solid #94a3b8;
+              transform:translateY(-2px) rotate(45deg);transition:transform .2s ease;}
+            [data-testid="stSidebar"] .st-key-nav_tools_open button::after{transform:translateY(2px) rotate(-135deg);}
+            [data-testid="stSidebar"] .st-key-tools_panel{margin:2px 0 6px 26px;padding-left:10px;border-left:2px solid var(--border);
+              width:calc(100% - 26px)!important;gap:2px;animation:ableToolsIn .22s ease-out;}
+            @keyframes ableToolsIn{from{opacity:0;transform:translateY(-6px);}to{opacity:1;transform:none;}}
+            [data-testid="stSidebar"] .st-key-tools_panel button{min-height:38px;border-radius:12px;font-size:14px;padding:0 12px;}
+            [data-testid="stSidebar"] .st-key-tools_panel button>div,
+            [data-testid="stSidebar"] .st-key-tools_panel button [data-testid="stMarkdownContainer"]{justify-content:flex-start!important;text-align:left!important;width:100%;}
+            [data-testid="stSidebar"] .st-key-tools_panel button p{font-size:14px;text-align:left!important;}
+            [data-testid="stSidebar"] .st-key-tools_panel button[kind="primary"]{background:var(--primary);color:#fff;font-weight:500;}
+            [data-testid="stSidebar"] .st-key-tools_panel hr{margin:8px 0;}
+            [data-testid="stSidebar"] [class*="st-key-xnav_"]{position:relative;}
+            [data-testid="stSidebar"] [class*="st-key-xnav_"] [class*="st-key-extra_nav_"] button,
+            [data-testid="stSidebar"] [class*="st-key-xnav_"] [class*="st-key-custom_nav_"] button{padding-right:30px;}
+            [data-testid="stSidebar"] [class*="st-key-xdel_"]{position:absolute!important;top:50%;right:6px;transform:translateY(-50%);
+              width:auto!important;z-index:5;}
+            [data-testid="stSidebar"] [class*="st-key-xdel_"] button{min-height:0!important;height:20px!important;width:20px!important;
+              padding:0!important;border:none!important;background:transparent!important;box-shadow:none!important;
+              color:#64748b!important;opacity:.35;justify-content:center!important;}
+            [data-testid="stSidebar"] [class*="st-key-xdel_"] button p{font-size:13px!important;line-height:1!important;text-align:center!important;}
+            [data-testid="stSidebar"] [class*="st-key-xdel_"] button:hover{opacity:.9;background:transparent!important;}
+            [data-testid="stSidebar"] [class*="st-key-xnav_"]:has(button[kind="primary"]) [class*="st-key-xdel_"] button{color:#fff!important;opacity:.6;}
+            </style>""")
+            if st.button("업무용 툴", key="nav_tools_open" if tools_open else "nav_tools_closed",
+                         icon=":material/handyman:", type="secondary"):
+                st.session_state.tools_open = not tools_open
+                st.rerun()
+            if tools_open:
+                with st.container(key="tools_panel"):
+                    extra_pages = [
+                        ("CSV 시각화 보고서", "csv_report"),
+                        ("마케팅 통합 대시보드", "m_dashboard"),
+                        ("경쟁사 마케팅 분석", "m_competitor"),
+                        ("SNS 콘텐츠 작성", "m_sns"),
+                        ("인플루언서 조사", "m_influencer"),
+                        ("마케팅 업무 기록", "m_history"),
+                    ]
+                    hidden = st.session_state.hidden_extra_pages
+                    # 기본 업무용 툴: × 누르면 메뉴에서 숨김
+                    for label, target in extra_pages:
+                        if target in hidden:
+                            continue
+                        with st.container(key=f"xnav_{target}"):
+                            if st.button(label, key=f"extra_nav_{target}", type="primary" if page == target else "secondary", use_container_width=True):
+                                go(target)
+                            if st.button("×", key=f"xdel_{target}", help=f"{label} 메뉴에서 숨기기"):
+                                hidden.append(target)
+                                if page == target:
+                                    go("summary")
+                                st.rerun()
+                    # LLM으로 추가한 기능: × 누르면 삭제
+                    for item in list(st.session_state.custom_task_templates):
+                        with st.container(key="xnav_c_" + item["id"]):
+                            if st.button(
+                                item["title"],
+                                key="custom_nav_" + item["id"],
+                                type="primary" if page == "custom_run" and st.session_state.get("custom_task_active_id") == item["id"] else "secondary",
+                                use_container_width=True,
+                            ):
+                                go("custom_run", custom_task_active_id=item["id"])
+                            if st.button("×", key="xdel_c_" + item["id"], help=f"{item['title']} 기능 삭제"):
+                                if remove_custom_task(item["id"]):
+                                    st.toast(f"{item['title']} 기능을 삭제했습니다.")
+                                st.rerun()
+                    if hidden:
+                        if st.button(f"숨긴 기능 {len(hidden)}개 다시 보기", key="extra_restore", use_container_width=True):
+                            hidden.clear()
                             st.rerun()
-                # LLM으로 추가한 기능: × 누르면 삭제
-                for item in list(st.session_state.custom_task_templates):
-                    with st.container(key="xnav_c_" + item["id"]):
-                        if st.button(
-                            item["title"],
-                            key="custom_nav_" + item["id"],
-                            type="primary" if page == "custom_run" and st.session_state.get("custom_task_active_id") == item["id"] else "secondary",
-                            use_container_width=True,
-                        ):
-                            go("custom_run", custom_task_active_id=item["id"])
-                        if st.button("×", key="xdel_c_" + item["id"], help=f"{item['title']} 기능 삭제"):
-                            if remove_custom_task(item["id"]):
-                                st.toast(f"{item['title']} 기능을 삭제했습니다.")
-                            st.rerun()
-                if hidden:
-                    if st.button(f"숨긴 기능 {len(hidden)}개 다시 보기", key="extra_restore", use_container_width=True):
-                        hidden.clear()
-                        st.rerun()
-                st.divider()
-                if st.button("＋ 추가하기", key="custom_nav_create", type="primary", use_container_width=True):
-                    go("custom_create")
-                st.caption("✨ 맡은 업무를 입력하면 LLM이 맞춤형 기능 틀을 만들어 줍니다.")
+                    st.divider()
+                    if st.button("＋ 추가하기", key="custom_nav_create", type="primary", use_container_width=True):
+                        go("custom_create")
+                    st.caption("✨ 맡은 업무를 입력하면 LLM이 맞춤형 기능 틀을 만들어 줍니다.")
         # TEAM_CSV_EXTENSION_END
 
         # 데이터 초기화 (확인 후 실행)
